@@ -1,16 +1,17 @@
 """
-Simple arbitrage bot for Bitcoin 15min markets following Jeremy Whittaker's strategy.
-
-Strategy: Buy both sides (UP and DOWN) when total cost < $1.00
-to guarantee profits regardless of the outcome.
+Simple arbitrage bot for Bitcoin 15min markets.
+Directional mode with two signal strategies: confluence (high threshold) or indicator-based (scoring).
 """
 
 import asyncio
 import logging
 import re
 import time
-from datetime import datetime
-from typing import Optional
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from typing import Optional, List, Dict
 
 import httpx
 
@@ -19,7 +20,6 @@ from .lookup import fetch_market_from_slug
 from .trading import (
     get_client,
     place_order,
-    get_positions,
     place_orders_fast,
     extract_order_id,
     wait_for_terminal_order,
@@ -29,227 +29,193 @@ from .wss_market import MarketWssClient
 
 
 logging.basicConfig(
-    level=logging.WARNING,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Disable HTTP logs from httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+class Colors:
+    RESET = "\033[0m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    GRAY = "\033[90m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    UNDERLINE = "\033[4m"
+
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def strip_ansi(text: str) -> str:
+    """Elimina los códigos ANSI de un texto."""
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+
 def find_current_btc_15min_market() -> str:
-    """
-    Find the current active BTC 15min market on Polymarket.
-    
-    Searches for markets matching the pattern 'btc-updown-15m-<timestamp>'
-    and returns the slug of the most recent/active market.
-    """
+    """Find the currently active BTC 15min market on Polymarket."""
     logger.info("Searching for current BTC 15min market...")
-    
     try:
-        # Search on Polymarket's crypto 15min page
         page_url = "https://polymarket.com/crypto/15M"
         resp = httpx.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         resp.raise_for_status()
-        
-        # Find the BTC market slug in the HTML
+
         pattern = r'btc-updown-15m-(\d+)'
         matches = re.findall(pattern, resp.text)
-        
         if not matches:
             raise RuntimeError("No active BTC 15min market found")
-        
-        # Prefer the most recent timestamp that is still OPEN.
-        # 15min markets close 900s after the timestamp in the slug.
+
         now_ts = int(datetime.now().timestamp())
-        all_ts = sorted((int(ts) for ts in matches), reverse=True)
-        open_ts = [ts for ts in all_ts if now_ts < (ts + 900)]
-        chosen_ts = open_ts[0] if open_ts else all_ts[0]
-        slug = f"btc-updown-15m-{chosen_ts}"
-        
-        logger.info(f"✅ Market found: {slug}")
-        return slug
-        
+        all_ts = sorted((int(ts) for ts in matches))
+
+        for ts in all_ts:
+            if ts <= now_ts < ts + 900:
+                slug = f"btc-updown-15m-{ts}"
+                logger.info(f"Active market: {slug}")
+                return slug
+
+        future_ts = [ts for ts in all_ts if ts > now_ts]
+        if future_ts:
+            next_ts = min(future_ts)
+            slug = f"btc-updown-15m-{next_ts}"
+            logger.info(f"Next market: {slug} (starts in {next_ts - now_ts}s)")
+            return slug
+
+        raise RuntimeError("No suitable market found")
+
     except Exception as e:
-        logger.error(f"Error searching for BTC 15min market: {e}")
-        # Fallback: try with the last known one
-        logger.warning("Using default market from configuration...")
+        logger.error(f"Error searching market: {e}")
         raise
 
 
 class SimpleArbitrageBot:
-    """Simple bot implementing Jeremy Whittaker's strategy."""
-    
     def __init__(self, settings):
         self.settings = settings
         self.client = get_client(settings)
-        
-        # Try to find current BTC 15min market automatically
-        try:
-            market_slug = find_current_btc_15min_market()
-        except Exception as e:
-            # Fallback: use the slug configured in .env
-            if settings.market_slug:
-                logger.info(f"Using configured market: {settings.market_slug}")
-                market_slug = settings.market_slug
-            else:
-                raise RuntimeError("Could not find BTC 15min market and no slug configured in .env")
-        
-        # Get token IDs from the market
-        logger.info(f"Getting market information: {market_slug}")
+
+        self._initialize_market()
+
+        self.opportunities_found = 0
+        self.trades_executed = 0
+        self.wins = 0
+        self.losses = 0
+        self.total_invested = 0.0
+        self.total_shares_bought = 0
+        self.open_positions: List[Dict] = []
+        self.cached_balance = None
+
+        self.sim_balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
+        self.sim_start_balance = self.sim_balance
+        self._last_execution_ts = 0.0
+        self._last_loss_ts = 0.0
+        self.last_action = "None"
+        self.last_trade_pnl = None
+
+        # Historial de trades cerrados (máximo 5)
+        self.trade_history: List[Dict] = []
+
+    def _add_to_history(self, trade: Dict):
+        """Añade un trade al historial, manteniendo solo los últimos 5."""
+        self.trade_history.append(trade)
+        if len(self.trade_history) > 5:
+            self.trade_history.pop(0)
+
+    def _initialize_market(self, forced_slug: Optional[str] = None):
+        if forced_slug:
+            market_slug = forced_slug
+            logger.info(f"Using market from assistant: {market_slug}")
+        else:
+            try:
+                market_slug = find_current_btc_15min_market()
+            except Exception:
+                if self.settings.market_slug:
+                    market_slug = self.settings.market_slug
+                    logger.info(f"Using configured market: {market_slug}")
+                else:
+                    raise RuntimeError("Could not find market")
+
+        logger.info(f"Fetching market info: {market_slug}")
         market_info = fetch_market_from_slug(market_slug)
-        
+
         self.market_id = market_info["market_id"]
         self.yes_token_id = market_info["yes_token_id"]
         self.no_token_id = market_info["no_token_id"]
-        
-        logger.info(f"Market ID: {self.market_id}")
-        logger.info(f"UP Token (YES): {self.yes_token_id}")
-        logger.info(f"DOWN Token (NO): {self.no_token_id}")
-        
-        # Extract market timestamp to calculate remaining time
-        # The timestamp in the slug is when it OPENS, not when it closes
-        # 15min markets close 15 minutes (900 seconds) later
-        import re
+        self.market_slug = market_slug
+
         match = re.search(r'btc-updown-15m-(\d+)', market_slug)
         market_start = int(match.group(1)) if match else None
-        self.market_end_timestamp = market_start + 900 if market_start else None  # +15 min
-        self.market_slug = market_slug
-        
-        self.last_check = None
-        self.opportunities_found = 0
-        self.trades_executed = 0
-        
-        # Investment tracking
-        self.total_invested = 0.0
-        self.total_shares_bought = 0
-        self.positions = []  # List of open positions
-        
-        # Cached balance (updated after each trade)
-        self.cached_balance = None
-        
-        # Simulation balance (used in dry_run mode)
-        self.sim_balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
-        self.sim_start_balance = self.sim_balance
+        self.market_end_timestamp = market_start + 900 if market_start else None
 
-        # Simple cooldown to avoid repeated orders on the same fleeting opportunity
-        self._last_execution_ts = 0.0
-    
+        logger.info(f"Market ID: {self.market_id}")
+        logger.info(f"UP Token: {self.yes_token_id}")
+        logger.info(f"DOWN Token: {self.no_token_id}")
+
+    def load_assistant_state(self):
+        try:
+            path = self.settings.assistant_state_file
+            if not os.path.exists(path):
+                logger.info(f"State file not found at {path}")
+                return None
+            with open(path, 'r') as f:
+                state = json.load(f)
+
+            timestamp = datetime.fromisoformat(state['timestamp'].replace('Z', '+00:00'))
+            age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+            if age > 5:
+                logger.warning(f"State too old ({age:.1f}s)")
+                return None
+
+            assistant_slug = state.get('marketSlug')
+            if assistant_slug and assistant_slug != self.market_slug:
+                logger.info(f"Assistant switched market: {assistant_slug}")
+                self._initialize_market(forced_slug=assistant_slug)
+
+            return state
+        except Exception as e:
+            logger.warning(f"Could not load state: {e}")
+            return None
+
     def get_time_remaining(self) -> str:
-        """Get remaining time until market closes."""
         if not self.market_end_timestamp:
             return "Unknown"
-        
-        from datetime import datetime
         now = int(datetime.now().timestamp())
         remaining = self.market_end_timestamp - now
-        
         if remaining <= 0:
             return "CLOSED"
-        
-        minutes = int(remaining // 60)
-        seconds = int(remaining % 60)
-        return f"{minutes}m {seconds}s"
-    
+        minutes = remaining // 60
+        seconds = remaining % 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def get_time_remaining_minutes(self) -> float:
+        if not self.market_end_timestamp:
+            return 15.0
+        now = int(datetime.now().timestamp())
+        remaining = self.market_end_timestamp - now
+        return max(0.0, remaining / 60.0)
+
     def get_balance(self) -> float:
-        """Get current USDC balance (or simulated balance in dry_run mode)."""
         if self.settings.dry_run:
             return self.sim_balance
         from .trading import get_balance
         return get_balance(self.settings)
-    
-    def get_current_prices(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-        """
-        Get current prices from order book (best ask = lowest price we can BUY at).
-        
-        Using best_ask ensures we get the actual available price, not a historical
-        trade price that may no longer be available.
-        
-        Returns:
-            (up_price, down_price, up_size, down_size) - prices and available sizes
-        """
-        try:
-            # Get order book for both tokens
-            up_book = self.get_order_book(self.yes_token_id)
-            down_book = self.get_order_book(self.no_token_id)
-            
-            # Use best_ask (lowest sell price = price we can buy at)
-            price_up = up_book.get("best_ask")
-            price_down = down_book.get("best_ask")
-            
-            # Available sizes at best ask prices
-            size_up = up_book.get("ask_size", 0)
-            size_down = down_book.get("ask_size", 0)
-            
-            # If no asks available, we can't buy
-            if price_up is None or price_down is None:
-                logger.warning("No asks available in order book")
-                return None, None, None, None
-            
-            return price_up, price_down, size_up, size_down
-        except Exception as e:
-            logger.error(f"Error getting prices: {e}")
-            return None, None, None, None
 
-    def _levels_to_tuples(self, levels) -> list[tuple[float, float]]:
-        """Convert OrderSummary-like objects into (price, size) tuples."""
-        tuples: list[tuple[float, float]] = []
-        for level in levels or []:
-            try:
-                price = float(level.price)
-                size = float(level.size)
-            except Exception:
-                continue
-            if size <= 0:
-                continue
-            tuples.append((price, size))
-        return tuples
-
-    def _compute_buy_fill(self, asks: list[tuple[float, float]], target_size: float) -> Optional[dict]:
-        """
-        Compute fill information for buying `target_size` shares using the ask book.
-
-        Returns:
-            dict with keys: filled, vwap, worst, best, cost
-            or None if not enough liquidity.
-        """
-        if target_size <= 0:
-            return None
-
-        # Cheapest asks first
-        sorted_asks = sorted(asks, key=lambda x: x[0])
-        filled = 0.0
-        cost = 0.0
-        worst = None
-        best = sorted_asks[0][0] if sorted_asks else None
-
-        for price, size in sorted_asks:
-            if filled >= target_size:
-                break
-            take = min(size, target_size - filled)
-            cost += take * price
-            filled += take
-            worst = price
-
-        if filled + 1e-9 < target_size:
-            return None
-
-        vwap = cost / filled if filled > 0 else None
-        return {
-            "filled": filled,
-            "vwap": vwap,
-            "worst": worst,
-            "best": best,
-            "cost": cost,
-        }
-    
     def get_order_book(self, token_id: str) -> dict:
-        """Get order book for a token."""
         try:
             book = self.client.get_order_book(token_id=token_id)
-            # The result is an OrderBookSummary object, not a dict
             bids = book.bids if hasattr(book, 'bids') and book.bids else []
             asks = book.asks if hasattr(book, 'asks') and book.asks else []
 
@@ -273,736 +239,653 @@ class SimpleArbitrageBot:
                         ask_size = s
                         break
 
-            spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
-
             return {
                 "best_bid": best_bid,
                 "best_ask": best_ask,
-                "spread": spread,
                 "bid_size": bid_size,
                 "ask_size": ask_size,
                 "bids": bid_levels,
                 "asks": ask_levels,
             }
         except Exception as e:
-            logger.error(f"Error getting order book: {e}")
-            return {}
+            logger.debug(f"Error fetching book for {token_id}: {e}")
+            return {"best_bid": None, "best_ask": None, "bid_size": 0, "ask_size": 0, "bids": [], "asks": []}
 
-    async def _fetch_order_books_parallel(self) -> tuple[dict, dict]:
-        """Fetch UP/DOWN order books concurrently to reduce per-scan latency."""
+    def _levels_to_tuples(self, levels):
+        tuples = []
+        for level in levels or []:
+            try:
+                price = float(level.price)
+                size = float(level.size)
+                if size > 0:
+                    tuples.append((price, size))
+            except:
+                continue
+        return tuples
+
+    def _compute_buy_fill(self, asks, target_size):
+        if target_size <= 0 or not asks:
+            return None
+        sorted_asks = sorted(asks, key=lambda x: x[0])
+        filled = 0.0
+        cost = 0.0
+        worst = None
+        best = sorted_asks[0][0]
+        for price, size in sorted_asks:
+            if filled >= target_size:
+                break
+            take = min(size, target_size - filled)
+            cost += take * price
+            filled += take
+            worst = price
+        if filled + 1e-9 < target_size:
+            return None
+        return {
+            "filled": filled,
+            "vwap": cost / filled,
+            "worst": worst,
+            "best": best,
+            "cost": cost,
+        }
+
+    async def _fetch_order_books_parallel(self):
         try:
             up_task = asyncio.to_thread(self.get_order_book, self.yes_token_id)
             down_task = asyncio.to_thread(self.get_order_book, self.no_token_id)
-            up_book, down_book = await asyncio.gather(up_task, down_task)
-            return up_book, down_book
-        except Exception as e:
-            logger.warning(f"Parallel order book fetch failed, falling back to sequential: {e}")
+            return await asyncio.gather(up_task, down_task)
+        except:
             return self.get_order_book(self.yes_token_id), self.get_order_book(self.no_token_id)
-    
-    def check_arbitrage(self, up_book: Optional[dict] = None, down_book: Optional[dict] = None) -> Optional[dict]:
+
+    def _technical_score(self, state, direction: str) -> float:
+        """Puntuación técnica (0-10) basada en indicadores (usada en modo confluence)."""
+        score = 0.0
+        rsi = state.get('rsi')
+        macd_hist = state.get('macdHist')
+        heiken_color = state.get('heikenColor')
+        heiken_count = state.get('heikenCount', 0)
+        vwap_slope = state.get('vwapSlope')
+        delta1m = state.get('delta1m')
+        delta3m = state.get('delta3m')
+
+        if direction == 'up':
+            if rsi is not None:
+                if rsi > 70:
+                    score -= 1
+                elif rsi > 60 and rsi < 70:
+                    score += 1
+                elif rsi > 50:
+                    score += 2
+                elif rsi < 30:
+                    score += 2
+            if macd_hist is not None and macd_hist > 0:
+                score += 2
+            if heiken_color == "green":
+                score += min(heiken_count, 3)
+            if vwap_slope is not None and vwap_slope > 0:
+                score += 3
+            if delta1m is not None and delta1m > 0:
+                score += 2
+            if delta3m is not None and delta3m > 0:
+                score += 2
+        else:  # down
+            if rsi is not None:
+                if rsi < 30:
+                    score -= 1
+                elif rsi < 40 and rsi > 30:
+                    score += 1
+                elif rsi < 50:
+                    score += 2
+                elif rsi > 70:
+                    score += 2
+            if macd_hist is not None and macd_hist < 0:
+                score += 2
+            if heiken_color == "red":
+                score += min(heiken_count, 3)
+            if vwap_slope is not None and vwap_slope < 0:
+                score += 3
+            if delta1m is not None and delta1m < 0:
+                score += 2
+            if delta3m is not None and delta3m < 0:
+                score += 2
+
+        return min(10, max(0, score))
+
+    def _indicator_score(self, state, direction: str) -> float:
         """
-        Check if an arbitrage opportunity exists.
-        
-        Uses order book (best ask) to get REAL prices we can buy at.
-        Also verifies there's enough liquidity at those prices.
-        
-        Returns dict with information if opportunity exists, None otherwise.
+        Calcula una puntuación basada en indicadores individuales (RSI, MACD, VWAP slope, deltas, Heiken Ashi).
+        Cada indicador favorable suma su peso, con posibles bonificaciones extra.
         """
-        # Pull full order books (allow caller to pass pre-fetched books to reduce latency)
-        if up_book is None:
-            up_book = self.get_order_book(self.yes_token_id)
-        if down_book is None:
-            down_book = self.get_order_book(self.no_token_id)
+        score = 0.0
+        rsi = state.get('rsi')
+        macd_hist = state.get('macdHist')
+        macd_hist_delta = state.get('macdHistDelta')
+        heiken_color = state.get('heikenColor')
+        heiken_count = state.get('heikenCount', 0)
+        vwap_slope = state.get('vwapSlope')
+        delta1m = state.get('delta1m')
+        delta3m = state.get('delta3m')
 
-        # Basic sanity: in a normal book, best_ask >= best_bid
-        for side_name, book in ("UP", up_book), ("DOWN", down_book):
-            best_bid = book.get("best_bid")
-            best_ask = book.get("best_ask")
-            if best_bid is not None and best_ask is not None and best_ask < best_bid:
-                logger.warning(
-                    f"{side_name} order book looks inverted (best_ask={best_ask:.4f} < best_bid={best_bid:.4f}); skipping scan"
-                )
-                return None
+        # --- RSI ---
+        if rsi is not None:
+            if direction == 'up':
+                if rsi >= self.settings.rsi_up_threshold:
+                    score += self.settings.weight_rsi
+                elif rsi <= 30:
+                    score += self.settings.weight_rsi * 1.5   # oversold extra
+                if rsi >= 70:
+                    score += self.settings.rsi_extreme_bonus
+            else:  # down
+                if rsi <= self.settings.rsi_down_threshold:
+                    score += self.settings.weight_rsi
+                elif rsi >= 70:
+                    score += self.settings.weight_rsi * 1.5
+                if rsi <= 30:
+                    score += self.settings.rsi_extreme_bonus
 
-        asks_up = up_book.get("asks", [])
-        asks_down = down_book.get("asks", [])
+        # --- MACD ---
+        if macd_hist is not None:
+            if direction == 'up' and macd_hist > 0:
+                score += self.settings.weight_macd
+                if macd_hist_delta is not None and macd_hist_delta > 0:
+                    score += self.settings.macd_expanding_bonus
+            elif direction == 'down' and macd_hist < 0:
+                score += self.settings.weight_macd
+                if macd_hist_delta is not None and macd_hist_delta < 0:
+                    score += self.settings.macd_expanding_bonus
 
-        # Compute the prices required to actually fill ORDER_SIZE shares (walk the book)
-        fill_up = self._compute_buy_fill(asks_up, float(self.settings.order_size))
-        fill_down = self._compute_buy_fill(asks_down, float(self.settings.order_size))
+        # --- VWAP slope ---
+        if vwap_slope is not None:
+            if direction == 'up' and vwap_slope > 0:
+                score += self.settings.weight_vwap_slope
+            elif direction == 'down' and vwap_slope < 0:
+                score += self.settings.weight_vwap_slope
 
-        if not fill_up or not fill_down:
-            return None
+        # --- Deltas (1m y 3m) ---
+        if delta1m is not None:
+            if direction == 'up' and delta1m > 0:
+                score += self.settings.weight_delta
+            elif direction == 'down' and delta1m < 0:
+                score += self.settings.weight_delta
+        if delta3m is not None:
+            if direction == 'up' and delta3m > 0:
+                score += self.settings.weight_delta
+            elif direction == 'down' and delta3m < 0:
+                score += self.settings.weight_delta
 
-        # For guaranteed arbitrage, use the *worst* price we might have to pay to fill the size
-        limit_price_up = fill_up["worst"]
-        limit_price_down = fill_down["worst"]
-        if limit_price_up is None or limit_price_down is None:
-            return None
+        # --- Heiken Ashi ---
+        if direction == 'up' and heiken_color == "green":
+            base = self.settings.weight_heiken
+            bonus = min(heiken_count - 1, self.settings.max_heiken_bonus) * self.settings.heiken_consecutive_bonus
+            score += base + bonus
+        elif direction == 'down' and heiken_color == "red":
+            base = self.settings.weight_heiken
+            bonus = min(heiken_count - 1, self.settings.max_heiken_bonus) * self.settings.heiken_consecutive_bonus
+            score += base + bonus
 
-        total_cost = limit_price_up + limit_price_down
+        return score
 
-        # Use <= to avoid missing exact-threshold opportunities due to rounding
-        if total_cost <= self.settings.target_pair_cost:
-            profit = 1.0 - total_cost
-            profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
-
-            investment = total_cost * self.settings.order_size
-            expected_payout = 1.0 * self.settings.order_size
-            expected_profit = expected_payout - investment
-
-            return {
-                # Prices we will actually place as LIMITs (to ensure fills)
-                "price_up": limit_price_up,
-                "price_down": limit_price_down,
-                "total_cost": total_cost,
-                "profit_per_share": profit,
-                "profit_pct": profit_pct,
-                "order_size": self.settings.order_size,
-                "total_investment": investment,
-                "expected_payout": expected_payout,
-                "expected_profit": expected_profit,
-
-                # Extra diagnostics
-                "best_ask_up": fill_up.get("best"),
-                "best_ask_down": fill_down.get("best"),
-                "vwap_up": fill_up.get("vwap"),
-                "vwap_down": fill_down.get("vwap"),
-                "timestamp": datetime.now().isoformat(),
-            }
-
-        return None
-    
-    def execute_arbitrage(self, opportunity: dict):
-        """Execute arbitrage by buying both sides."""
-
-        # Cooldown guard (applies to both live and dry-run)
-        now = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else time.time()
-        if self.settings.cooldown_seconds and (now - self._last_execution_ts) < float(self.settings.cooldown_seconds):
-            logger.info(f"Cooldown active ({self.settings.cooldown_seconds}s); skipping execution")
-            return
-        self._last_execution_ts = now
-        
-        # Count opportunity found (regardless of execution)
-        self.opportunities_found += 1
-        
-        logger.info("=" * 70)
-        logger.info("🎯 ARBITRAGE OPPORTUNITY DETECTED")
-        logger.info("=" * 70)
-        logger.info(f"UP limit price:       ${opportunity['price_up']:.4f}")
-        logger.info(f"DOWN limit price:     ${opportunity['price_down']:.4f}")
-        if 'vwap_up' in opportunity and 'vwap_down' in opportunity:
-            logger.info(f"UP VWAP (est):        ${opportunity['vwap_up']:.4f}")
-            logger.info(f"DOWN VWAP (est):      ${opportunity['vwap_down']:.4f}")
-        logger.info(f"Total cost:           ${opportunity['total_cost']:.4f}")
-        logger.info(f"Profit per share:     ${opportunity['profit_per_share']:.4f}")
-        logger.info(f"Profit %:             {opportunity['profit_pct']:.2f}%")
-        logger.info("-" * 70)
-        logger.info(f"Order size:           {opportunity['order_size']} shares each side")
-        logger.info(f"Total investment:     ${opportunity['total_investment']:.2f}")
-        logger.info(f"Expected payout:      ${opportunity['expected_payout']:.2f}")
-        logger.info(f"EXPECTED PROFIT:      ${opportunity['expected_profit']:.2f}")
-        logger.info("=" * 70)
-        
+    def _record_trade(self, side: str, entry_price: float, exit_price: float, size: float,
+                      profit_pct: float, action_type: str):
+        """Registra un trade cerrado en el historial."""
+        profit_usd = (exit_price - entry_price) * size
+        trade = {
+            'side': side,
+            'entry': entry_price,
+            'exit': exit_price,
+            'size': size,
+            'profit_pct': profit_pct,
+            'profit_usd': profit_usd,
+            'action': action_type,
+            'time': datetime.now().strftime("%H:%M:%S")
+        }
+        self._add_to_history(trade)
+        # También actualizamos el last_trade_pnl para la línea de última acción
+        self.last_trade_pnl = profit_pct
+        # Log del nuevo balance después del cierre
         if self.settings.dry_run:
-            logger.info("🔸 SIMULATION MODE - No real orders will be executed")
-            
-            # Check simulated balance
-            if self.sim_balance < opportunity['total_investment']:
-                logger.error(f"❌ Insufficient simulated balance: need ${opportunity['total_investment']:.2f} but have ${self.sim_balance:.2f}")
-                return
-            
-            # Deduct from simulated balance
-            self.sim_balance -= opportunity['total_investment']
-            logger.info(f"💰 Simulated balance: ${self.sim_balance:.2f} (after deducting ${opportunity['total_investment']:.2f})")
-            
-            # Track simulated investment
-            self.total_invested += opportunity['total_investment']
-            self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
-            self.positions.append(opportunity)
-            self.trades_executed += 1
-            logger.info("=" * 70)
-            return
-        
-        # Check balance before executing (with 20% safety margin)
-        logger.info("\nVerifying balance...")
-        # Use cached balance if available, otherwise fetch from API
-        if self.cached_balance is not None:
-            current_balance = self.cached_balance
-            logger.info(f"Available balance (cached): ${current_balance:.2f}")
-        else:
-            current_balance = self.get_balance()
-            self.cached_balance = current_balance
-            logger.info(f"Available balance: ${current_balance:.2f}")
-        
-        required_balance = opportunity['total_investment'] * 1.2  # 20% safety margin
-        logger.info(f"Required (+ 20% margin): ${required_balance:.2f}")
-        
-        if current_balance < required_balance:
-            logger.error(f"❌ Insufficient balance: need ${required_balance:.2f} but have ${current_balance:.2f}")
-            logger.error("20% extra margin required to avoid mid-execution failures")
-            logger.error("Arbitrage will not be executed")
-            return
-        
-        try:
-            # Execute orders
-            logger.info("\n📤 Submitting both legs...")
-            
-            # Use exact prices from arbitrage opportunity
-            up_price = opportunity['price_up']
-            down_price = opportunity['price_down']
-            
-            # Prepare both orders
-            orders = [
-                {
-                    "side": "BUY",
-                    "token_id": self.yes_token_id,
-                    "price": up_price,
-                    "size": self.settings.order_size
-                },
-                {
-                    "side": "BUY",
-                    "token_id": self.no_token_id,
-                    "price": down_price,
-                    "size": self.settings.order_size
-                }
-            ]
-            
-            logger.info(f"   UP:   {self.settings.order_size} shares @ ${up_price:.4f}")
-            logger.info(f"   DOWN: {self.settings.order_size} shares @ ${down_price:.4f}")
-            logger.info(f"   OrderType: {getattr(self.settings, 'order_type', 'GTC')}")
-            
-            # Execute both orders as fast as possible
-            results = place_orders_fast(self.settings, orders, order_type=getattr(self.settings, 'order_type', 'GTC'))
+            logger.info(f"Balance after trade: ${self.sim_balance:.2f}")
 
-            # Extract order ids and surface any immediate submission errors.
-            # Preserve index mapping: orders[0] is UP, orders[1] is DOWN.
-            submission_errors: list[str] = []
-            order_ids_by_idx: list[Optional[str]] = [None, None]
-            for idx, r in enumerate((results or [])[:2]):
-                if isinstance(r, dict) and "error" in r:
-                    submission_errors.append(str(r.get("error")))
-                    continue
-                oid = extract_order_id(r) if isinstance(r, dict) else None
-                order_ids_by_idx[idx] = oid
+    def _manage_position(self, pos: Dict) -> bool:
+        """Gestiona una posición individual. Retorna True si se cerró."""
+        side = pos['side']
+        token_id = self.yes_token_id if side == "UP" else self.no_token_id
+        avg_price = pos['avg_price']
+        pos_size = pos['size']
 
-            if submission_errors:
-                for msg in submission_errors:
-                    logger.error(f"❌ Order submit error: {msg}")
+        book = self.get_order_book(token_id)
+        current_price = book.get("best_bid")
+        if current_price is None:
+            logger.warning(f"No best bid for exit for {side}")
+            return False
 
-            if not order_ids_by_idx[0] or not order_ids_by_idx[1]:
-                # Can't reliably verify fills without ids; treat as failure.
-                raise RuntimeError(f"Could not extract both order ids from responses: {results}")
+        profit_pct = (current_price - avg_price) / avg_price * 100
+        remaining_min = self.get_time_remaining_minutes()
+        logger.info(f"Position {side}: entry=${avg_price:.4f}, current=${current_price:.4f}, P&L={profit_pct:.2f}%, time left={remaining_min:.1f}min")
 
-            logger.info("✅ Submitted 2 orders; verifying fills...")
-
-            # We know we submitted in order: UP first, DOWN second.
-            up_order_id, down_order_id = order_ids_by_idx[0], order_ids_by_idx[1]
-            req_size = float(self.settings.order_size)
-
-            up_state = wait_for_terminal_order(self.settings, up_order_id, requested_size=req_size)
-            down_state = wait_for_terminal_order(self.settings, down_order_id, requested_size=req_size)
-
-            up_filled = bool(up_state.get("filled"))
-            down_filled = bool(down_state.get("filled"))
-            up_filled_size = float(up_state.get("filled_size") or 0.0)
-            down_filled_size = float(down_state.get("filled_size") or 0.0)
-
-            logger.info(
-                f"Order status: UP(id={up_order_id}, status={up_state.get('status')}, filled={up_filled_size:.4f}) | "
-                f"DOWN(id={down_order_id}, status={down_state.get('status')}, filled={down_filled_size:.4f})"
-            )
-
-            if submission_errors or not (up_filled and down_filled):
-                # Best-effort cleanup: cancel anything still open
-                try:
-                    cancel_orders(self.settings, [up_order_id, down_order_id])
-                except Exception as cancel_exc:
-                    logger.warning(f"Cancel cleanup failed: {cancel_exc}")
-
-                # If one leg filled, attempt to flatten exposure immediately.
-                filled_token_id = None
-                filled_size = 0.0
-                if up_filled and not down_filled:
-                    filled_token_id = self.yes_token_id
-                    filled_size = up_filled_size if up_filled_size > 0 else req_size
-                elif down_filled and not up_filled:
-                    filled_token_id = self.no_token_id
-                    filled_size = down_filled_size if down_filled_size > 0 else req_size
-
-                if filled_token_id and filled_size > 0:
-                    logger.warning("⚠️ Partial fill detected; attempting to flatten exposure (SELL filled leg)")
-                    try:
-                        book = self.get_order_book(filled_token_id)
-                        best_bid = book.get("best_bid")
-                        if best_bid is None:
-                            raise RuntimeError("No best_bid available to unwind")
-                        # Marketable limit sell: price at or below best_bid.
-                        # Use FAK so we reduce exposure even if the bid is thin.
-                        place_order(
-                            self.settings,
-                            side="SELL",
-                            token_id=filled_token_id,
-                            price=float(best_bid),
-                            size=float(filled_size),
-                            tif="FAK",
-                        )
-                        logger.info(f"Submitted unwind SELL for {filled_size:.4f} @ bid={best_bid:.4f} (FAK)")
-                    except Exception as unwind_exc:
-                        logger.error(f"❌ Unwind attempt failed: {unwind_exc}")
-
-                raise RuntimeError("Paired execution failed (not both legs filled)")
-
-            logger.info("\n" + "=" * 70)
-            logger.info("✅ ARBITRAGE EXECUTED (BOTH LEGS FILLED)")
-            logger.info("=" * 70)
-
-            self.trades_executed += 1
-            
-            # Track real investment
-            self.total_invested += opportunity['total_investment']
-            self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
-            self.positions.append(opportunity)
-            
-            # Update cached balance after trade
-            new_balance = self.get_balance()
-            self.cached_balance = new_balance
-            logger.info(f"💰 Updated balance: ${new_balance:.2f}")
-            
-            # Get and show current positions
-            self.show_current_positions()
-            
-        except Exception as e:
-            logger.error(f"\n❌ Error executing arbitrage: {e}")
-            logger.error("❌ Orders were NOT executed - tracking was not updated")
-    
-    def show_current_positions(self):
-        """Show current share positions for UP and DOWN tokens."""
-        try:
-            positions = get_positions(self.settings, [self.yes_token_id, self.no_token_id])
-            
-            up_shares = positions.get(self.yes_token_id, {}).get("size", 0)
-            down_shares = positions.get(self.no_token_id, {}).get("size", 0)
-            
-            logger.info("-" * 70)
-            logger.info("📊 CURRENT POSITIONS:")
-            logger.info(f"   UP shares:   {up_shares:.2f}")
-            logger.info(f"   DOWN shares: {down_shares:.2f}")
-            logger.info("-" * 70)
-            
-        except Exception as e:
-            logger.warning(f"Could not fetch positions: {e}")
-    
-    def get_market_result(self) -> Optional[str]:
-        """Get which option won the market."""
-        try:
-            # Get final prices
-            price_up, price_down, _, _ = self.get_current_prices()
-            
-            if price_up is None or price_down is None:
-                return None
-            
-            # In closed markets, winner has price 1.0 and loser 0.0
-            if price_up >= 0.99:
-                return "UP (goes up) 📈"
-            elif price_down >= 0.99:
-                return "DOWN (goes down) 📉"
-            else:
-                # Market not resolved yet, see which has higher probability
-                if price_up > price_down:
-                    return f"UP leading ({price_up:.2%})"
+        # --- Trailing stop ---
+        if profit_pct > 0:
+            if pos.get('trailing_peak') is None or profit_pct > pos['trailing_peak']:
+                pos['trailing_peak'] = profit_pct
+            elif (pos['trailing_peak'] - profit_pct) >= self.settings.trailing_pct:
+                logger.info(f"Trailing stop triggered: peak {pos['trailing_peak']:.2f}% -> current {profit_pct:.2f}%")
+                action = "TRAIL"
+                self.last_action = f"TRAIL {side} @ {current_price:.4f}"
+                if not self.settings.dry_run:
+                    place_order(self.settings, side="SELL", token_id=token_id,
+                                price=current_price, size=pos_size, tif="FAK")
                 else:
-                    return f"DOWN leading ({price_down:.2%})"
-        except Exception as e:
-            logger.error(f"Error getting result: {e}")
-            return None
-    
-    def show_final_summary(self):
-        """Show final summary when market closes."""
-        logger.info("\n" + "=" * 70)
-        logger.info("🏁 MARKET CLOSED - FINAL SUMMARY")
-        logger.info("=" * 70)
-        logger.info(f"Market: {self.market_slug}")
-        
-        # Get market result
-        result = self.get_market_result()
-        if result:
-            logger.info(f"Result: {result}")
-        
-        logger.info(f"Mode: {'🔸 SIMULATION' if self.settings.dry_run else '🔴 REAL TRADING'}")
-        logger.info("-" * 70)
-        logger.info(f"Total opportunities detected:    {self.opportunities_found}")
-        logger.info(f"Total trades executed:           {self.trades_executed if not self.settings.dry_run else self.opportunities_found}")
-        logger.info(f"Total shares bought:             {self.total_shares_bought}")
-        logger.info("-" * 70)
-        logger.info(f"Total invested:                  ${self.total_invested:.2f}")
-        
-        # Calculate expected profit
-        if self.settings.dry_run:
-            expected_payout = sum(float(p.get("expected_payout", 0.0)) for p in (self.positions or []))
+                    self.sim_balance += current_price * pos_size
+                self.wins += 1
+                self._record_trade(side, avg_price, current_price, pos_size, profit_pct, action)
+                return True
         else:
-            expected_payout = (self.total_shares_bought / 2) * 1.0  # Each pair pays $1.00
+            pos['trailing_peak'] = None
 
-        expected_profit = expected_payout - self.total_invested
-        profit_pct = (expected_profit / self.total_invested * 100) if self.total_invested > 0 else 0
-        
-        logger.info(f"Expected payout at close:        ${expected_payout:.2f}")
-        logger.info(f"Expected profit:                 ${expected_profit:.2f} ({profit_pct:.2f}%)")
+        # --- Timeout en positivo ---
+        if profit_pct > 0:
+            if pos.get('first_positive_ts') is None:
+                pos['first_positive_ts'] = time.time()
+            time_positive = time.time() - pos['first_positive_ts']
+            if time_positive >= self.settings.take_profit_timeout_seconds:
+                logger.info(f"Position positive for {time_positive:.1f}s, taking profit")
+                action = "TIMEOUT"
+                self.last_action = f"TP_TIMEOUT {side} @ {current_price:.4f}"
+                if not self.settings.dry_run:
+                    place_order(self.settings, side="SELL", token_id=token_id,
+                                price=current_price, size=pos_size, tif="FAK")
+                else:
+                    self.sim_balance += current_price * pos_size
+                self.wins += 1
+                self._record_trade(side, avg_price, current_price, pos_size, profit_pct, action)
+                return True
+        else:
+            pos['first_positive_ts'] = None
 
-        if self.settings.dry_run:
-            cash_remaining = float(self.sim_balance)
-            cash_after_claim = cash_remaining + float(expected_payout)
-            net_change = cash_after_claim - float(self.sim_start_balance)
-            net_change_pct = (net_change / float(self.sim_start_balance) * 100) if self.sim_start_balance > 0 else 0
-            logger.info("-" * 70)
-            logger.info(f"Sim start cash:                  ${self.sim_start_balance:.2f}")
-            logger.info(f"Sim cash remaining:              ${cash_remaining:.2f}")
-            logger.info(f"Sim cash after claiming:         ${cash_after_claim:.2f}")
-            logger.info(f"Sim net change:                  ${net_change:.2f} ({net_change_pct:.2f}%)")
-        logger.info("=" * 70)
-    
-    def run_once(self) -> bool:
-        """Scan once for opportunities."""
-        # Check if market closed
-        time_remaining = self.get_time_remaining()
-        if time_remaining == "CLOSED":
-            return False  # Signal to stop the bot
+        # --- Take profit y stop loss fijos ---
+        target_price = avg_price * (1 + self.settings.profit_target_pct / 100)
+        stop_price = avg_price * (1 - self.settings.stop_loss_pct / 100)
+        target_price = min(target_price, 0.999)
+        stop_price = max(stop_price, 0.001)
 
-        # Fetch both books once per scan (most expensive operations)
-        up_book = self.get_order_book(self.yes_token_id)
-        down_book = self.get_order_book(self.no_token_id)
+        # --- Salida anticipada si el mercado está por cerrar ---
+        if remaining_min < self.settings.exit_before_close_minutes and profit_pct > 0:
+            logger.info(f"Early exit: market closing soon, taking profit {profit_pct:.2f}% at {current_price:.4f}")
+            action = "EARLY"
+            self.last_action = f"EARLY {side} @ {current_price:.4f}"
+            if not self.settings.dry_run:
+                place_order(self.settings, side="SELL", token_id=token_id,
+                            price=current_price, size=pos_size, tif="FAK")
+            else:
+                self.sim_balance += current_price * pos_size
+            self.wins += 1
+            self._record_trade(side, avg_price, current_price, pos_size, profit_pct, action)
+            return True
 
-        opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
-        
-        if opportunity:
-            self.execute_arbitrage(opportunity)
+        if profit_pct >= self.settings.profit_target_pct or current_price >= target_price:
+            logger.info(f"Profit target reached ({profit_pct:.2f}%). Selling {pos_size} shares.")
+            action = "TP"
+            self.last_action = f"TP {side} @ {current_price:.4f}"
+            if not self.settings.dry_run:
+                place_order(self.settings, side="SELL", token_id=token_id,
+                            price=current_price, size=pos_size, tif="FAK")
+            else:
+                self.sim_balance += current_price * pos_size
+            self.wins += 1
+            self._record_trade(side, avg_price, current_price, pos_size, profit_pct, action)
+            return True
+        elif profit_pct <= -self.settings.stop_loss_pct or current_price <= stop_price:
+            logger.info(f"Stop loss triggered ({profit_pct:.2f}%). Selling {pos_size} shares.")
+            action = "SL"
+            self.last_action = f"SL {side} @ {current_price:.4f}"
+            if not self.settings.dry_run:
+                place_order(self.settings, side="SELL", token_id=token_id,
+                            price=current_price, size=pos_size, tif="FAK")
+            else:
+                self.sim_balance += current_price * pos_size
+            self.losses += 1
+            self._last_loss_ts = time.time()
+            self._record_trade(side, avg_price, current_price, pos_size, profit_pct, action)
             return True
         else:
-            price_up = up_book.get("best_ask")
-            price_down = down_book.get("best_ask")
-            size_up = up_book.get("ask_size", 0)
-            size_down = down_book.get("ask_size", 0)
-
-            if price_up is not None and price_down is not None:
-                best_total = price_up + price_down
-
-                # Compute fill-based totals for ORDER_SIZE (more accurate than best_ask)
-                fill_up = self._compute_buy_fill(up_book.get("asks", []), float(self.settings.order_size))
-                fill_down = self._compute_buy_fill(down_book.get("asks", []), float(self.settings.order_size))
-
-                fill_msg = ""
-                if fill_up and fill_down and fill_up.get("worst") is not None and fill_down.get("worst") is not None:
-                    worst_total = float(fill_up["worst"]) + float(fill_down["worst"])
-                    vwap_total = float(fill_up["vwap"]) + float(fill_down["vwap"]) if (fill_up.get("vwap") is not None and fill_down.get("vwap") is not None) else None
-                    if vwap_total is not None:
-                        fill_msg = f" | fill(worst)=${worst_total:.4f} vwap=${vwap_total:.4f}"
-                    else:
-                        fill_msg = f" | fill(worst)=${worst_total:.4f}"
-
-                logger.info(
-                    f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
-                    f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
-                    f"[Time: {time_remaining}]"
-                )
+            self.last_action = f"HOLD {side} ({profit_pct:+.2f}%)"
             return False
 
     async def run_once_async(self) -> bool:
-        """Scan once for opportunities (async; fetches books in parallel)."""
-        # Check if market closed
-        time_remaining = self.get_time_remaining()
-        if time_remaining == "CLOSED":
-            return False  # Signal to stop the bot
+        time_remaining_str = self.get_time_remaining()
+        if time_remaining_str == "CLOSED":
+            return False
 
-        # Fetch both books concurrently (reduces per-scan latency)
         up_book, down_book = await self._fetch_order_books_parallel()
 
-        opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
+        if self.settings.trade_mode.lower() == "directional":
+            state = self.load_assistant_state()
+            if not state:
+                logger.info("No valid assistant state")
+                return False
 
-        if opportunity:
-            self.execute_arbitrage(opportunity)
-            return True
-
-        price_up = up_book.get("best_ask")
-        price_down = down_book.get("best_ask")
-        size_up = up_book.get("ask_size", 0)
-        size_down = down_book.get("ask_size", 0)
-
-        if price_up is not None and price_down is not None:
-            best_total = price_up + price_down
-
-            # Compute fill-based totals for ORDER_SIZE (more accurate than best_ask)
-            fill_up = self._compute_buy_fill(up_book.get("asks", []), float(self.settings.order_size))
-            fill_down = self._compute_buy_fill(down_book.get("asks", []), float(self.settings.order_size))
-
-            fill_msg = ""
-            if fill_up and fill_down and fill_up.get("worst") is not None and fill_down.get("worst") is not None:
-                worst_total = float(fill_up["worst"]) + float(fill_down["worst"])
-                vwap_total = float(fill_up["vwap"]) + float(fill_down["vwap"]) if (fill_up.get("vwap") is not None and fill_down.get("vwap") is not None) else None
-                if vwap_total is not None:
-                    fill_msg = f" | fill(worst)=${worst_total:.4f} vwap=${vwap_total:.4f}"
+            # ---- Gestión de posiciones abiertas ----
+            closed_any = False
+            remaining_positions = []
+            for pos in self.open_positions:
+                if self._manage_position(pos):
+                    closed_any = True
                 else:
-                    fill_msg = f" | fill(worst)=${worst_total:.4f}"
+                    remaining_positions.append(pos)
+            self.open_positions = remaining_positions
+            if closed_any:
+                pass
 
-            logger.info(
-                f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
-                f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
-                f"[Time: {time_remaining}]"
-            )
+            # ---- Evaluación de nuevas entradas ----
+            if len(self.open_positions) >= self.settings.max_positions:
+                logger.info(f"Max positions reached ({self.settings.max_positions}), skipping new entry")
+                return False
 
+            time_left_min = state.get('timeLeftMin', 15)
+            if time_left_min < self.settings.min_time_left_minutes:
+                logger.info(f"Too close to close ({time_left_min:.1f} min), skipping")
+                return False
+
+            now = time.time()
+            if self._last_loss_ts and (now - self._last_loss_ts) < self.settings.cooldown_after_loss_seconds:
+                logger.info(f"Cooldown after loss, skipping ({self.settings.cooldown_after_loss_seconds}s)")
+                return False
+
+            # --- Elegir método de señal según configuración ---
+            if self.settings.signal_mode == "indicator_based":
+                # --- Señal basada en indicadores individuales (puntuación) ---
+                score_up = self._indicator_score(state, 'up')
+                score_down = self._indicator_score(state, 'down')
+                logger.info(f"Indicator scores: UP={score_up:.2f} DOWN={score_down:.2f} (min={self.settings.indicator_min_score})")
+
+                # Evaluamos el lado con mayor puntuación
+                if score_up >= self.settings.indicator_min_score and score_up > score_down:
+                    price = up_book.get("best_ask")
+                    if price is not None and price <= self.settings.max_entry_price:
+                        # Nuevo filtro: evitar comprar muy barato en los últimos minutos
+                        if time_left_min < self.settings.min_price_apply_minutes and price < self.settings.min_price_at_end:
+                            logger.info(f"Price {price:.4f} too low in final minutes ({time_left_min:.1f} min left), skipping")
+                            return False
+                        logger.info(f"INDICATOR SIGNAL: UP (score={score_up:.2f})")
+                        await self._execute_entry("UP", state)
+                        return True
+                    else:
+                        logger.info(f"UP price {price if price is not None else 'N/A'} > {self.settings.max_entry_price}, skipping")
+                elif score_down >= self.settings.indicator_min_score and score_down > score_up:
+                    price = down_book.get("best_ask")
+                    if price is not None and price <= self.settings.max_entry_price:
+                        if time_left_min < self.settings.min_price_apply_minutes and price < self.settings.min_price_at_end:
+                            logger.info(f"Price {price:.4f} too low in final minutes ({time_left_min:.1f} min left), skipping")
+                            return False
+                        logger.info(f"INDICATOR SIGNAL: DOWN (score={score_down:.2f})")
+                        await self._execute_entry("DOWN", state)
+                        return True
+                    else:
+                        logger.info(f"DOWN price {price if price is not None else 'N/A'} > {self.settings.max_entry_price}, skipping")
+                else:
+                    logger.info("No indicator signal")
+                return False
+
+            else:  # modo "confluence" (por defecto)
+                # --- Señal de confluencia técnica (TA prob + diff + tech score) ---
+                ta_prob_up = state.get('taProbabilityUp', 0)
+                ta_prob_down = state.get('taProbabilityDown', 0)
+                tech_score_up = self._technical_score(state, 'up')
+                tech_score_down = self._technical_score(state, 'down')
+                logger.info(f"Confluence: TA prob UP={ta_prob_up:.2f} DOWN={ta_prob_down:.2f} tech UP={tech_score_up:.1f} DOWN={tech_score_down:.1f}")
+
+                prob_diff_up = ta_prob_up - ta_prob_down
+                prob_diff_down = ta_prob_down - ta_prob_up
+
+                # UP
+                if (ta_prob_up >= self.settings.min_ta_prob and
+                    prob_diff_up >= self.settings.ta_prob_diff_min and
+                    tech_score_up >= self.settings.tech_score_confluence):
+                    price = up_book.get("best_ask")
+                    if price is not None and price <= self.settings.max_entry_price:
+                        if time_left_min < self.settings.min_price_apply_minutes and price < self.settings.min_price_at_end:
+                            logger.info(f"Price {price:.4f} too low in final minutes ({time_left_min:.1f} min left), skipping")
+                            return False
+                        logger.info(f"CONFLUENCE SIGNAL: UP (TA prob={ta_prob_up:.2f}, diff={prob_diff_up:.2f}, score={tech_score_up:.1f})")
+                        await self._execute_entry("UP", state)
+                        return True
+                    else:
+                        logger.info(f"UP price {price if price is not None else 'N/A'} > {self.settings.max_entry_price}, skipping")
+
+                # DOWN
+                if (ta_prob_down >= self.settings.min_ta_prob and
+                    prob_diff_down >= self.settings.ta_prob_diff_min and
+                    tech_score_down >= self.settings.tech_score_confluence):
+                    price = down_book.get("best_ask")
+                    if price is not None and price <= self.settings.max_entry_price:
+                        if time_left_min < self.settings.min_price_apply_minutes and price < self.settings.min_price_at_end:
+                            logger.info(f"Price {price:.4f} too low in final minutes ({time_left_min:.1f} min left), skipping")
+                            return False
+                        logger.info(f"CONFLUENCE SIGNAL: DOWN (TA prob={ta_prob_down:.2f}, diff={prob_diff_down:.2f}, score={tech_score_down:.1f})")
+                        await self._execute_entry("DOWN", state)
+                        return True
+                    else:
+                        logger.info(f"DOWN price {price if price is not None else 'N/A'} > {self.settings.max_entry_price}, skipping")
+
+                logger.info("No confluence signal")
+                return False
+
+        # Modo arbitraje (no modificado)
         return False
-    
-    async def monitor(self, interval_seconds: int = 30):
-        """Continuously monitor for opportunities."""
+
+    async def _execute_entry(self, target_side: str, state: dict) -> bool:
+        """Ejecuta la entrada en el lado especificado (UP o DOWN) y añade la posición a la lista."""
+        token_id = self.yes_token_id if target_side == "UP" else self.no_token_id
+        book = self.get_order_book(token_id)
+        fill = self._compute_buy_fill(book.get("asks", []), self.settings.position_size)
+        if not fill:
+            logger.warning("Insufficient liquidity")
+            return False
+
+        price = fill["vwap"]
+        if price > self.settings.max_entry_price:
+            logger.info(f"Entry price {price:.4f} > max {self.settings.max_entry_price}, skipping")
+            return False
+
+        logger.info(f"ENTRY {target_side} @ VWAP ${price:.4f}")
+        self.last_action = f"ENTRY {target_side} @ {price:.4f}"
+        self.last_trade_pnl = None
+
+        if not self.settings.dry_run:
+            place_order(self.settings, side="BUY", token_id=token_id,
+                        price=price, size=self.settings.position_size, tif="FOK")
+        else:
+            cost = price * self.settings.position_size
+            self.sim_balance -= cost
+            self.total_invested += cost
+            self.total_shares_bought += self.settings.position_size
+            self.trades_executed += 1
+            self.open_positions.append({
+                'side': target_side,
+                'size': self.settings.position_size,
+                'avg_price': price,
+                'first_positive_ts': None,
+                'trailing_peak': None
+            })
+            logger.info(f"New balance after entry: ${self.sim_balance:.2f}")
+        return True
+
+    def render_display(self, state=None):
+        clear_screen()
+        up_book = self.get_order_book(self.yes_token_id)
+        down_book = self.get_order_book(self.no_token_id)
+
+        print(f"{Colors.BOLD}{Colors.WHITE}╔{'═'*78}╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}║{' ' * 78}║{Colors.RESET}")
+        title = f" BTC 15min ARBITRAGE BOT - {self.settings.trade_mode.upper()} MODE "
+        print(f"{Colors.BOLD}{Colors.WHITE}║{title.center(78)}║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}╠{'═'*78}╣{Colors.RESET}")
+
+        market_line = f" Market: {self.market_slug}"
+        time_line = f" Time left: {self.get_time_remaining()}"
+        print(f"{Colors.BOLD}{Colors.WHITE}║{market_line:<50}{time_line:>28}║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}╠{'═'*78}╣{Colors.RESET}")
+
+        if state:
+            pred = state.get('prediction', 'NEUTRAL')
+            prob_up = state.get('probabilityUp', 0)
+            prob_down = state.get('probabilityDown', 0)
+            edge_up = state.get('edgeUp', 0)
+            edge_down = state.get('edgeDown', 0)
+            ta_prob_up = state.get('taProbabilityUp', 0)
+            ta_prob_down = state.get('taProbabilityDown', 0)
+            pred_color = Colors.GREEN if pred == 'LONG' else Colors.RED if pred == 'SHORT' else Colors.GRAY
+            print(f"{Colors.BOLD}{Colors.WHITE}║ ASSISTANT: {pred_color}{pred:<6}{Colors.RESET}  UP: {Colors.GREEN}{prob_up*100:5.1f}% (edge {edge_up:+.3f})  DOWN: {Colors.RED}{prob_down*100:5.1f}% (edge {edge_down:+.3f}){Colors.RESET}{' ' * 4}║{Colors.RESET}")
+            tech_up = self._technical_score(state, 'up')
+            tech_down = self._technical_score(state, 'down')
+            print(f"{Colors.BOLD}{Colors.WHITE}║ TECH SCORE:  UP: {Colors.GREEN}{tech_up:.1f}{Colors.RESET}  |  DOWN: {Colors.RED}{tech_down:.1f}{Colors.RESET}{' ' * 46}║{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.WHITE}║ TA PROB:     UP: {Colors.GREEN}{ta_prob_up*100:5.1f}%{Colors.RESET}  |  DOWN: {Colors.RED}{ta_prob_down*100:5.1f}%{Colors.RESET}{' ' * 46}║{Colors.RESET}")
+            if self.settings.signal_mode == "indicator_based":
+                ind_up = self._indicator_score(state, 'up')
+                ind_down = self._indicator_score(state, 'down')
+                print(f"{Colors.BOLD}{Colors.WHITE}║ IND SCORE:    UP: {Colors.GREEN}{ind_up:.1f}{Colors.RESET}  |  DOWN: {Colors.RED}{ind_down:.1f}{Colors.RESET}{' ' * 46}║{Colors.RESET}")
+        else:
+            print(f"{Colors.BOLD}{Colors.WHITE}║ ASSISTANT: {Colors.GRAY}No data{Colors.RESET}{' ' * 58}║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}╠{'═'*78}╣{Colors.RESET}")
+
+        print(f"{Colors.BOLD}{Colors.WHITE}║ POSITIONS ({len(self.open_positions)}):{' ' * 62}║{Colors.RESET}")
+        if self.open_positions:
+            for i, pos in enumerate(self.open_positions):
+                side = pos['side']
+                size = pos['size']
+                avg = pos['avg_price']
+                token_id = self.yes_token_id if side == "UP" else self.no_token_id
+                book = self.get_order_book(token_id)
+                bid = book.get("best_bid")
+                if bid:
+                    pnl = (bid - avg) / avg * 100
+                    pnl_color = Colors.GREEN if pnl > 0 else Colors.RED
+                    first_pos = pos.get('first_positive_ts')
+                    pos_time = f" (pos {time.time()-first_pos:.0f}s)" if first_pos else ""
+                    peak_str = f"  peak {pos['trailing_peak']:.2f}%" if pos.get('trailing_peak') is not None else ""
+                    line = f"   #{i+1} {side}: {size:.2f} @ {avg:.4f}  Bid: {bid:.4f}  {pnl_color}P&L: {pnl:+.2f}%{pos_time}{peak_str}{Colors.RESET}"
+                else:
+                    line = f"   #{i+1} {side}: {size:.2f} @ {avg:.4f}  Bid: N/A"
+                print(f"{Colors.BOLD}{Colors.WHITE}║{line:<76}║{Colors.RESET}")
+        else:
+            print(f"{Colors.BOLD}{Colors.WHITE}║   No open positions{' ' * 56}║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}╠{'═'*78}╣{Colors.RESET}")
+
+        def fmt_price(p):
+            return f"{p:.4f}" if isinstance(p, (int, float)) else "-"
+
+        up_ask = fmt_price(up_book.get("best_ask"))
+        up_bid = fmt_price(up_book.get("best_bid"))
+        down_ask = fmt_price(down_book.get("best_ask"))
+        down_bid = fmt_price(down_book.get("best_bid"))
+
+        print(f"{Colors.BOLD}{Colors.WHITE}║ MARKET PRICES:{' ' * 62}║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}║   UP: Ask: {Colors.GREEN}{up_ask}{Colors.RESET}  Bid: {Colors.GREEN}{up_bid}{Colors.RESET}  |  DOWN: Ask: {Colors.RED}{down_ask}{Colors.RESET}  Bid: {Colors.RED}{down_bid}{Colors.RESET}{' ' * 6}║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}╠{'═'*78}╣{Colors.RESET}")
+
+        balance = self.get_balance()
+        bal_color = Colors.GREEN if balance > 0 else Colors.RED
+        print(f"{Colors.BOLD}{Colors.WHITE}║ Balance: {bal_color}${balance:,.2f}{Colors.RESET}  |  Invested: ${self.total_invested:.2f}  |  Trades: {self.trades_executed}  |  Opportunities: {self.opportunities_found}{' ' * 10}║{Colors.RESET}")
+
+        total_closed = self.wins + self.losses
+        if total_closed > 0:
+            winrate = self.wins / total_closed * 100
+            print(f"{Colors.BOLD}{Colors.WHITE}║ Wins: {Colors.GREEN}{self.wins}{Colors.RESET}  Losses: {Colors.RED}{self.losses}{Colors.RESET}  Winrate: {Colors.YELLOW}{winrate:.2f}%{Colors.RESET}{' ' * 43}║{Colors.RESET}")
+        else:
+            print(f"{Colors.BOLD}{Colors.WHITE}║ No closed trades yet.{' ' * 55}║{Colors.RESET}")
+
+        # --- Línea de última acción con P&L ---
+        action_text = self.last_action
+        if self.last_trade_pnl is not None:
+            action_text += f" (P&L: {self.last_trade_pnl:+.2f}%)"
+        visible_len = len(strip_ansi(f"Last action: {action_text}"))
+        padding = max(0, 76 - visible_len)
+        print(f"{Colors.BOLD}{Colors.WHITE}║ Last action: {Colors.CYAN}{action_text}{Colors.RESET}{' ' * padding}║{Colors.RESET}")
+
+        # --- Historial de últimos 5 trades ---
+        if self.trade_history:
+            print(f"{Colors.BOLD}{Colors.WHITE}╠{'═'*78}╣{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.WHITE}║ TRADE HISTORY (last 5):{' ' * 53}║{Colors.RESET}")
+            # Cabecera
+            header = f" #  Side  Entry   Exit    P&L%   P&L$   Action"
+            print(f"{Colors.BOLD}{Colors.WHITE}║ {header:<76}║{Colors.RESET}")
+            for idx, trade in enumerate(reversed(self.trade_history[-5:]), 1):
+                side = trade['side']
+                entry = trade['entry']
+                exit_p = trade['exit']
+                pct = trade['profit_pct']
+                usd = trade['profit_usd']
+                action = trade['action'][:6]  # abreviar
+                # Colorear según ganancia/pérdida
+                pct_color = Colors.GREEN if pct > 0 else Colors.RED if pct < 0 else Colors.WHITE
+                usd_color = Colors.GREEN if usd > 0 else Colors.RED if usd < 0 else Colors.WHITE
+                line = f"{idx:2}  {side:4}  {entry:.4f}  {exit_p:.4f}  {pct_color}{pct:+6.2f}%{Colors.RESET}  {usd_color}{usd:+6.2f}${Colors.RESET}  {action:<6}"
+                print(f"{Colors.BOLD}{Colors.WHITE}║ {line:<76}║{Colors.RESET}")
+        else:
+            print(f"{Colors.BOLD}{Colors.WHITE}║{' ' * 76}║{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.WHITE}║   No trades yet.{' ' * 64}║{Colors.RESET}")
+
+        print(f"{Colors.BOLD}{Colors.WHITE}╚{'═'*78}╝{Colors.RESET}")
+        print(f"{Colors.DIM}{Colors.GRAY}Press Ctrl+C to stop{Colors.RESET}")
+
+    async def monitor(self, interval_seconds=1):
         if getattr(self.settings, "use_wss", False):
             await self.monitor_wss()
             return
-        logger.info("=" * 70)
-        logger.info("🚀 BITCOIN 15MIN ARBITRAGE BOT STARTED")
-        logger.info("=" * 70)
-        logger.info(f"Market: {self.market_slug}")
-        logger.info(f"Time remaining: {self.get_time_remaining()}")
-        logger.info(f"Mode: {'🔸 SIMULATION' if self.settings.dry_run else '🔴 REAL TRADING'}")
-        logger.info(f"Cost threshold: ${self.settings.target_pair_cost:.3f}")
-        logger.info(f"Order size: {self.settings.order_size} shares")
-        logger.info(f"Interval: {interval_seconds}s")
-        logger.info("=" * 70)
-        logger.info("")
-        
+
         scan_count = 0
-        
         try:
             while True:
                 scan_count += 1
-                logger.info(f"\n[Scan #{scan_count}] {datetime.now().strftime('%H:%M:%S')}")
-                
-                # Check if market closed
                 if self.get_time_remaining() == "CLOSED":
-                    logger.info("\n🚨 Market has closed!")
+                    logger.info("Market closed!")
                     self.show_final_summary()
-                    
-                    # Search for the next market
-                    logger.info("\n🔄 Searching for next BTC 15min market...")
                     try:
-                        new_market_slug = find_current_btc_15min_market()
-                        if new_market_slug != self.market_slug:
-                            logger.info(f"✅ New market found: {new_market_slug}")
-                            logger.info("Restarting bot with new market...")
-                            # Restart the bot with the new market
-                            self.__init__(self.settings)
+                        new_slug = find_current_btc_15min_market()
+                        if new_slug != self.market_slug:
+                            logger.info(f"New market: {new_slug}")
+                            self._initialize_market(forced_slug=new_slug)
                             scan_count = 0
                             continue
-                        else:
-                            logger.info("⏳ Waiting for new market... (30s)")
-                            await asyncio.sleep(30)
-                            continue
                     except Exception as e:
-                        logger.error(f"Error searching for new market: {e}")
-                        logger.info("Retrying in 30 seconds...")
+                        logger.error(f"Error finding new market: {e}")
                         await asyncio.sleep(30)
                         continue
-                
-                # Use async scan to fetch books in parallel
+
+                state = self.load_assistant_state()
+                self.render_display(state)
                 await self.run_once_async()
-                
-                logger.info(f"Opportunities found: {self.opportunities_found}/{scan_count}")
-                if not self.settings.dry_run:
-                    logger.info(f"Trades executed: {self.trades_executed}")
-                
-                logger.info(f"Waiting {interval_seconds}s...\n")
+                logger.info(f"Scan #{scan_count} completed. Waiting {interval_seconds}s...")
                 await asyncio.sleep(interval_seconds)
-                
+
         except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("\n" + "=" * 70)
-            logger.info("🛑 Bot stopped by user")
-            logger.info(f"Total scans: {scan_count}")
-            logger.info(f"Opportunities found: {self.opportunities_found}")
-            if not self.settings.dry_run:
-                logger.info(f"Trades executed: {self.trades_executed}")
-            logger.info("=" * 70)
+            logger.info("Bot stopped by user")
+            self.show_final_summary()
 
-    def _book_from_state(self, bid_levels: list[tuple[float, float]], ask_levels: list[tuple[float, float]]) -> dict:
-        best_bid = max((p for p, _ in bid_levels), default=None)
-        best_ask = min((p for p, _ in ask_levels), default=None)
-
-        bid_size = 0.0
-        if best_bid is not None:
-            for p, s in bid_levels:
-                if p == best_bid:
-                    bid_size = s
-                    break
-
-        ask_size = 0.0
-        if best_ask is not None:
-            for p, s in ask_levels:
-                if p == best_ask:
-                    ask_size = s
-                    break
-
-        spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
-
-        return {
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "spread": spread,
-            "bid_size": bid_size,
-            "ask_size": ask_size,
-            "bids": bid_levels,
-            "asks": ask_levels,
-        }
-
-    async def monitor_wss(self):
-        """Monitor using Polymarket CLOB Market WebSocket instead of polling."""
-        # This loop keeps WSS running across market rollovers.
-        while True:
-            # If the detected market is already closed, rollover immediately.
-            if self.get_time_remaining() == "CLOSED":
-                logger.info("\n🚨 Market has closed (before WSS start).")
-                self.show_final_summary()
-                logger.info("\n🔄 Searching for next BTC 15min market...")
-                try:
-                    new_market_slug = find_current_btc_15min_market()
-                    if new_market_slug != self.market_slug:
-                        logger.info(f"✅ New market found: {new_market_slug}")
-                        logger.info("Restarting bot with new market...")
-                        self.__init__(self.settings)
-                        continue
-                    logger.info("⏳ Waiting for new market... (10s)")
-                    await asyncio.sleep(10)
-                    continue
-                except Exception as e:
-                    logger.error(f"Error searching for new market: {e}")
-                    logger.info("Retrying in 10 seconds...")
-                    await asyncio.sleep(10)
-                    continue
-
-            logger.info("=" * 70)
-            logger.info("🚀 BITCOIN 15MIN ARBITRAGE BOT STARTED (WSS MODE)")
-            logger.info("=" * 70)
-            logger.info(f"Market: {self.market_slug}")
-            logger.info(f"Time remaining: {self.get_time_remaining()}")
-            logger.info(f"Mode: {'🔸 SIMULATION' if self.settings.dry_run else '🔴 REAL TRADING'}")
-            logger.info(f"Cost threshold: ${self.settings.target_pair_cost:.3f}")
-            logger.info(f"Order size: {self.settings.order_size} shares")
-            logger.info(f"WSS URL: {self.settings.ws_url}")
-            logger.info("=" * 70)
-            logger.info("")
-
-            client = MarketWssClient(
-                ws_base_url=self.settings.ws_url,
-                asset_ids=[self.yes_token_id, self.no_token_id],
-            )
-
-            last_eval = 0.0
-            eval_min_interval_s = 0.05  # avoid evaluating too frequently on rapid deltas
-            eval_count = 0
-
-            try:
-                async for asset_id, event_type in client.run():
-                    # Periodic close check
-                    if self.get_time_remaining() == "CLOSED":
-                        logger.info("\n🚨 Market has closed!")
-                        self.show_final_summary()
-                        # Roll over to next market
-                        logger.info("\n🔄 Searching for next BTC 15min market...")
-                        try:
-                            new_market_slug = find_current_btc_15min_market()
-                            if new_market_slug != self.market_slug:
-                                logger.info(f"✅ New market found: {new_market_slug}")
-                                logger.info("Restarting bot with new market...")
-                                self.__init__(self.settings)
-                                break
-                            logger.info("⏳ Waiting for new market... (10s)")
-                            await asyncio.sleep(10)
-                            break
-                        except Exception as e:
-                            logger.error(f"Error searching for new market: {e}")
-                            logger.info("Retrying in 10 seconds...")
-                            await asyncio.sleep(10)
-                            break
-
-                    # Debounce evaluation
-                    now = asyncio.get_running_loop().time()
-                    if (now - last_eval) < eval_min_interval_s:
-                        continue
-                    last_eval = now
-                    eval_count += 1
-                    logger.info(f"\n[WSS Eval #{eval_count}] {datetime.now().strftime('%H:%M:%S')} (trigger={event_type}:{asset_id[:8]}…)")
-
-                    yes_state = client.get_book(self.yes_token_id)
-                    no_state = client.get_book(self.no_token_id)
-                    if not yes_state or not no_state:
-                        if self.settings.verbose:
-                            logger.info("WSS eval skipped: missing book state (waiting for initial snapshots)")
-                        continue
-
-                    yes_bids, yes_asks = yes_state.to_levels()
-                    no_bids, no_asks = no_state.to_levels()
-                    if not yes_asks or not no_asks:
-                        if self.settings.verbose:
-                            logger.info("WSS eval skipped: missing asks on one side (no buyable liquidity yet)")
-                        continue
-
-                    up_book = self._book_from_state(yes_bids, yes_asks)
-                    down_book = self._book_from_state(no_bids, no_asks)
-
-                    opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
-                    if opportunity:
-                        self.execute_arbitrage(opportunity)
-                        continue
-
-                    # Minimal "no arb" logging using the same in-memory snapshot
-                    price_up = up_book.get("best_ask")
-                    price_down = down_book.get("best_ask")
-                    size_up = up_book.get("ask_size", 0)
-                    size_down = down_book.get("ask_size", 0)
-
-                    if price_up is not None and price_down is not None:
-                        best_total = float(price_up) + float(price_down)
-                        fill_up = self._compute_buy_fill(up_book.get("asks", []), float(self.settings.order_size))
-                        fill_down = self._compute_buy_fill(down_book.get("asks", []), float(self.settings.order_size))
-
-                        fill_msg = ""
-                        if fill_up and fill_down and fill_up.get("worst") is not None and fill_down.get("worst") is not None:
-                            worst_total = float(fill_up["worst"]) + float(fill_down["worst"])
-                            vwap_total = float(fill_up["vwap"]) + float(fill_down["vwap"]) if (fill_up.get("vwap") is not None and fill_down.get("vwap") is not None) else None
-                            if vwap_total is not None:
-                                fill_msg = f" | fill(worst)=${worst_total:.4f} vwap=${vwap_total:.4f}"
-                            else:
-                                fill_msg = f" | fill(worst)=${worst_total:.4f}"
-
-                        logger.info(
-                            f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
-                            f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
-                            f"[Time: {self.get_time_remaining()}]"
-                        )
-                    else:
-                        if self.settings.verbose:
-                            logger.info("WSS eval skipped: best ask missing (book not ready)")
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                raise
-            except Exception as e:
-                logger.warning(f"WSS monitor loop error, reconnecting: {e}")
-                await asyncio.sleep(1.0)
-                continue
+    def show_final_summary(self):
+        logger.info("\n" + "="*70)
+        logger.info("MARKET CLOSED - FINAL SUMMARY")
+        logger.info(f"Market: {self.market_slug}")
+        logger.info(f"Mode: {'SIMULATION' if self.settings.dry_run else 'REAL'}")
+        logger.info(f"Trades executed: {self.trades_executed}")
+        logger.info(f"Wins: {self.wins} | Losses: {self.losses}")
+        if self.wins + self.losses > 0:
+            logger.info(f"Winrate: {self.wins/(self.wins+self.losses)*100:.2f}%")
+        logger.info(f"Total invested: ${self.total_invested:.2f}")
+        if self.settings.dry_run:
+            logger.info(f"Final simulated balance: ${self.sim_balance:.2f}")
+        logger.info("="*70)
 
 
 async def main():
-    """Main entry point."""
-    
-    # Load configuration
     settings = load_settings()
-    
-    # Validate configuration
     if not settings.private_key:
-        logger.error("❌ Error: POLYMARKET_PRIVATE_KEY not configured in .env")
+        logger.error("POLYMARKET_PRIVATE_KEY not configured")
         return
-    
-    # Create and run bot
     try:
         bot = SimpleArbitrageBot(settings)
-        await bot.monitor(interval_seconds=0)  # Scan continuously
+        await bot.monitor(interval_seconds=1)
     except Exception as e:
-        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        logger.error(f"Fatal error: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
