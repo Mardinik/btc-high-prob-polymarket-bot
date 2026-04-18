@@ -1,8 +1,7 @@
 """
 Bot de alta probabilidad para mercados de Bitcoin 15 minutos.
 Estrategia: apostar por el lado con probabilidad de mercado > ENTRY_PROB_THRESHOLD cuando queden menos de 7.5 minutos.
-Permite coberturas sucesivas (hedge) alternando lados: cada nueva apuesta es en el lado contrario a la última,
-con tamaño = total_actual_del_lado_contrario * HEDGE_MULTIPLIER.
+Permite coberturas sucesivas (hedge) alternando lados, con tamaño = total_actual_del_lado_contrario * HEDGE_MULTIPLIER.
 """
 
 import asyncio
@@ -17,9 +16,9 @@ import httpx
 
 from .config import load_settings
 from .lookup import fetch_market_from_slug
-from .trading import get_client, place_order
+from .trading import get_client, place_order, get_balance
 
-# Configuración de logging: solo mensajes relevantes
+# Configuración de logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -31,7 +30,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Silenciar logs ruidosos de httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Colores ANSI
@@ -54,9 +52,7 @@ def strip_ansi(text):
     return re.sub(r'\x1b\[[0-9;]*m', '', text)
 
 def fmt_price(price):
-    if price is None:
-        return "-"
-    return f"{price:.4f}"
+    return "-" if price is None else f"{price:.4f}"
 
 def find_current_btc_15min_market() -> Optional[str]:
     try:
@@ -95,13 +91,18 @@ class HighProbabilityBot:
         self.wins = 0
         self.losses = 0
         self.total_invested = 0.0
-        self.sim_balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
-        self.sim_start_balance = self.sim_balance
+
+        # Balance: simulado o real
+        if self.settings.dry_run:
+            self.balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
+        else:
+            self.balance = self._get_real_balance()
+        self.start_balance = self.balance
 
         self.last_action = "None"
         self.last_trade_pnl = None
 
-        # Parámetros de la estrategia (cargados desde config)
+        # Parámetros
         self.entry_prob_threshold = getattr(settings, 'entry_prob_threshold', 0.78)
         self.hedge_prob_threshold = getattr(settings, 'hedge_prob_threshold', 0.78)
         self.hedge_multiplier = getattr(settings, 'hedge_multiplier', 1.0)
@@ -111,6 +112,19 @@ class HighProbabilityBot:
         self.min_time_to_operate_min = self.min_time_to_operate_seconds / 60.0
 
         self._refresh_market(raise_on_fail=False)
+
+    def _get_real_balance(self) -> float:
+        """Obtiene el balance real desde Polymarket."""
+        try:
+            return get_balance(self.settings)
+        except Exception as e:
+            logger.error(f"Error obteniendo balance real: {e}")
+            return 0.0
+
+    def _update_balance_display(self):
+        """Actualiza self.balance con el valor real (si no es simulación)."""
+        if not self.settings.dry_run:
+            self.balance = self._get_real_balance()
 
     def _refresh_market(self, forced_slug: Optional[str] = None, raise_on_fail: bool = True):
         if forced_slug:
@@ -171,23 +185,23 @@ class HighProbabilityBot:
         try:
             resp = self.client.get_price(token_id=self.yes_token_id, side='buy')
             up_buy = float(resp.get('price')) if resp and 'price' in resp else None
-        except Exception as e:
-            logger.debug(f"Error UP buy: {e}")
+        except Exception:
+            pass
         try:
             resp = self.client.get_price(token_id=self.yes_token_id, side='sell')
             up_sell = float(resp.get('price')) if resp and 'price' in resp else None
-        except Exception as e:
-            logger.debug(f"Error UP sell: {e}")
+        except Exception:
+            pass
         try:
             resp = self.client.get_price(token_id=self.no_token_id, side='buy')
             down_buy = float(resp.get('price')) if resp and 'price' in resp else None
-        except Exception as e:
-            logger.debug(f"Error DOWN buy: {e}")
+        except Exception:
+            pass
         try:
             resp = self.client.get_price(token_id=self.no_token_id, side='sell')
             down_sell = float(resp.get('price')) if resp and 'price' in resp else None
-        except Exception as e:
-            logger.debug(f"Error DOWN sell: {e}")
+        except Exception:
+            pass
 
         return {
             'up_ask': up_buy,
@@ -222,12 +236,13 @@ class HighProbabilityBot:
         cost = price * size
 
         if self.settings.dry_run:
-            if cost > self.sim_balance:
-                logger.error(f"Saldo insuficiente: ${self.sim_balance:.2f} < ${cost:.2f}")
+            if cost > self.balance:
+                logger.error(f"Saldo insuficiente simulado: ${self.balance:.2f} < ${cost:.2f}")
                 return False
-            self.sim_balance -= cost
+            self.balance -= cost
             self.total_invested += cost
         else:
+            # Modo real: no verificamos saldo simulado, intentamos la orden directamente
             token_id = self.yes_token_id if side == "UP" else self.no_token_id
             try:
                 place_order(self.settings, side="BUY", token_id=token_id,
@@ -251,7 +266,8 @@ class HighProbabilityBot:
         if multiplier is not None:
             msg += f" [hedge x{multiplier}]"
         logger.info(msg)
-        logger.info(f"💰 Balance después de apuesta: ${self.sim_balance:.2f}")
+        if self.settings.dry_run:
+            logger.info(f"💰 Balance después de apuesta: ${self.balance:.2f}")
         self.last_action = f"BET {side} @ {price:.4f}"
         return True
 
@@ -262,7 +278,7 @@ class HighProbabilityBot:
             profit_pct = (1.0 / bet['entry_price'] - 1.0) * 100
             self.wins += 1
             if self.settings.dry_run:
-                self.sim_balance += bet['size']
+                self.balance += bet['size']
         else:
             result = "LOSS"
             profit_usd = -bet['entry_price'] * bet['size']
@@ -311,7 +327,12 @@ class HighProbabilityBot:
                 for bet in self.active_bets:
                     self._resolve_bet(bet, winner)
                 self.active_bets = []
-                logger.info(f"💰 Balance final del mercado: ${self.sim_balance:.2f}")
+                if self.settings.dry_run:
+                    logger.info(f"💰 Balance final del mercado: ${self.balance:.2f}")
+                else:
+                    # Actualizamos el balance real después de resolver
+                    self._update_balance_display()
+                    logger.info(f"💰 Balance real actualizado: ${self.balance:.2f}")
             self.market_resolved = True
             self.market_slug = None
             self._refresh_market(raise_on_fail=False)
@@ -347,7 +368,7 @@ class HighProbabilityBot:
         total_up = sum(b['size'] for b in self.active_bets if b['side'] == 'UP')
         total_down = sum(b['size'] for b in self.active_bets if b['side'] == 'DOWN')
 
-        # --- Entrada inicial (solo si no hay apuestas) ---
+        # Entrada inicial
         if not self.active_bets:
             if probs['prob_up'] > self.entry_prob_threshold and probs['up_ask'] is not None and time_left_min < self.entry_time_min:
                 self._place_bet("UP", probs['up_ask'])
@@ -358,7 +379,7 @@ class HighProbabilityBot:
             else:
                 return
 
-        # --- Si ya hay apuestas, solo podemos apostar en el lado contrario al último ---
+        # Si ya hay apuestas, solo podemos apostar en el lado contrario al último
         if self.last_bet_side is None:
             return
 
@@ -367,7 +388,6 @@ class HighProbabilityBot:
         opposite_ask = probs['up_ask'] if opposite_side == "UP" else probs['down_ask']
 
         if opposite_prob > self.hedge_prob_threshold and opposite_ask is not None:
-            # Calcular tamaño: total_actual_del_lado_contrario * hedge_multiplier
             if opposite_side == "UP":
                 other_total = total_down
             else:
@@ -377,10 +397,8 @@ class HighProbabilityBot:
                 self._place_bet(opposite_side, opposite_ask, size, self.hedge_multiplier)
                 return
 
-        # Límite de apuestas totales
         if len(self.active_bets) >= self.max_bets_per_market:
             logger.debug(f"Límite de apuestas alcanzado ({self.max_bets_per_market})")
-            return
 
     def render_display(self):
         clear_screen()
@@ -455,9 +473,9 @@ class HighProbabilityBot:
 
         total_trades = self.wins + self.losses
         winrate = (self.wins / total_trades * 100) if total_trades > 0 else 0
-        net_profit = self.sim_balance - self.sim_start_balance
+        net_profit = self.balance - self.start_balance
         profit_color = Colors.GREEN if net_profit > 0 else Colors.RED if net_profit < 0 else Colors.WHITE
-        print(f"{Colors.BOLD}{Colors.WHITE}║ Wins: {Colors.GREEN}{self.wins}{Colors.RESET}  Losses: {Colors.RED}{self.losses}{Colors.RESET}  Winrate: {Colors.YELLOW}{winrate:.2f}%{Colors.RESET}  Net P&L: {profit_color}${net_profit:+.2f}{Colors.RESET}  Balance: ${self.sim_balance:.2f}  Invested: ${self.total_invested:.2f}{' ' * 4}║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.WHITE}║ Wins: {Colors.GREEN}{self.wins}{Colors.RESET}  Losses: {Colors.RED}{self.losses}{Colors.RESET}  Winrate: {Colors.YELLOW}{winrate:.2f}%{Colors.RESET}  Net P&L: {profit_color}${net_profit:+.2f}{Colors.RESET}  Balance: ${self.balance:.2f}  Invested: ${self.total_invested:.2f}{' ' * 4}║{Colors.RESET}")
 
         if self.trades_history:
             print(f"{Colors.BOLD}{Colors.WHITE}╠{'═'*78}╣{Colors.RESET}")
@@ -489,6 +507,9 @@ class HighProbabilityBot:
             while True:
                 self.run_cycle()
                 self.render_display()
+                # Actualizar balance real cada 10 segundos (modo real)
+                if not self.settings.dry_run and not self.market_resolved:
+                    self._update_balance_display()
                 await asyncio.sleep(interval_seconds)
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("Bot detenido por el usuario")
@@ -497,12 +518,12 @@ class HighProbabilityBot:
     def show_final_summary(self):
         total_trades = self.wins + self.losses
         winrate = (self.wins / total_trades * 100) if total_trades > 0 else 0
-        net_profit = self.sim_balance - self.sim_start_balance
+        net_profit = self.balance - self.start_balance
         logger.info("\n" + "="*70)
         logger.info("RESUMEN FINAL")
         logger.info(f"Mercados procesados: {len(self.trades_history)}")
         logger.info(f"Wins: {self.wins} | Losses: {self.losses} | Winrate: {winrate:.2f}%")
-        logger.info(f"Beneficio neto: ${net_profit:.2f} (Balance final: ${self.sim_balance:.2f})")
+        logger.info(f"Beneficio neto: ${net_profit:.2f} (Balance final: ${self.balance:.2f})")
         logger.info("="*70)
 
 

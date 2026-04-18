@@ -18,8 +18,25 @@ from .config import Settings
 
 logger = logging.getLogger(__name__)
 
-
 _cached_client = None
+
+# Caché simple para neg_risk (por token_id)
+_neg_risk_cache = {}
+
+
+def get_neg_risk_for_token(client, token_id):
+    """Obtiene el valor neg_risk para un token, con caché."""
+    if token_id in _neg_risk_cache:
+        return _neg_risk_cache[token_id]
+    try:
+        neg_risk = client.get_neg_risk(token_id)
+        _neg_risk_cache[token_id] = neg_risk
+        return neg_risk
+    except Exception as e:
+        logger.debug(f"Error getting neg_risk for {token_id}: {e}")
+        _neg_risk_cache[token_id] = False
+        return False
+
 
 def get_client(settings: Settings) -> ClobClient:
     global _cached_client
@@ -32,16 +49,18 @@ def get_client(settings: Settings) -> ClobClient:
     
     host = "https://clob.polymarket.com"
     
-    # Create client with signature_type=1 for Magic/Email accounts
+    # Usar funder exactamente como viene (recomendado con checksum)
+    funder = settings.funder.strip() if settings.funder else None
+    
     _cached_client = ClobClient(
         host, 
         key=settings.private_key.strip(), 
         chain_id=137, 
         signature_type=settings.signature_type, 
-        funder=settings.funder.strip() if settings.funder else None
+        funder=funder
     )
     
-    # Derive API credentials - simple method that works
+    # Derivar credenciales API
     logger.info("Deriving User API credentials from private key...")
     derived_creds = _cached_client.create_or_derive_api_creds()
     _cached_client.set_api_creds(derived_creds)
@@ -49,7 +68,7 @@ def get_client(settings: Settings) -> ClobClient:
     logger.info("✅ API credentials configured")
     logger.info(f"   API Key: {derived_creds.api_key}")
     logger.info(f"   Wallet: {_cached_client.get_address()}")
-    logger.info(f"   Funder: {settings.funder}")
+    logger.info(f"   Funder: {funder}")
     
     return _cached_client
 
@@ -58,7 +77,6 @@ def get_balance(settings: Settings) -> float:
     """Get USDC balance from Polymarket account."""
     try:
         client = get_client(settings)
-        # Get USDC (COLLATERAL) balance
         params = BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL,
             signature_type=settings.signature_type
@@ -68,11 +86,10 @@ def get_balance(settings: Settings) -> float:
         if isinstance(result, dict):
             balance_raw = result.get("balance", "0")
             balance_wei = float(balance_raw)
-            # USDC has 6 decimals
             balance_usdc = balance_wei / 1_000_000
             return balance_usdc
         
-        logger.warning(f"Respuesta inesperada obteniendo balance: {result}")
+        logger.warning(f"Unexpected response getting balance: {result}")
         return 0.0
     except Exception as e:
         logger.error(f"Error getting balance: {e}")
@@ -94,7 +111,6 @@ def place_order(settings: Settings, *, side: str, token_id: str, price: float, s
     client = get_client(settings)
     
     try:
-        # Create order args
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
@@ -102,55 +118,45 @@ def place_order(settings: Settings, *, side: str, token_id: str, price: float, s
             side=BUY if side_up == "BUY" else SELL
         )
         
-        # BTC 15min markets are neg_risk but auto-detection via /neg-risk endpoint
-        # often fails (returns "Invalid token id"). Force neg_risk=True for these markets.
-        # This is safe: the worst case for non-neg_risk markets is a rejected order, not a bad signature.
-        options = PartialCreateOrderOptions(neg_risk=True)
+        # Determinar neg_risk dinámicamente
+        neg_risk = get_neg_risk_for_token(client, token_id)
+        options = PartialCreateOrderOptions(neg_risk=neg_risk)
         signed_order = client.create_order(order_args, options)
         
         tif_up = (tif or "GTC").upper()
         order_type = getattr(OrderType, tif_up, OrderType.GTC)
         return client.post_order(signed_order, order_type)
-    except Exception as exc:  # pragma: no cover - passthrough from client
+    except Exception as exc:
         raise RuntimeError(f"place_order failed: {exc}") from exc
 
 
-
 def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str = "GTC") -> list[dict]:
-    """Place multiple orders as fast as possible.
-
-    Strategy: pre-sign all orders first, then submit them together.
-    This minimizes the time gap between legs.
-
-    Args:
-        settings: Bot settings
-        orders: List of order dicts with keys: side, token_id, price, size
-        order_type: One of OrderType: FOK, FAK, GTC, GTD
-
-    Returns:
-        List of order results.
+    """
+    Place multiple orders as fast as possible.
+    Pre-signs all orders first, then submits them together.
     """
     client = get_client(settings)
 
     tif_up = (order_type or "GTC").upper()
     ot = getattr(OrderType, tif_up, OrderType.GTC)
 
-    # Step 1: Pre-sign all orders (this is the slow part)
-    # Force neg_risk=True for BTC 15min markets (auto-detection fails)
-    options = PartialCreateOrderOptions(neg_risk=True)
+    # Pre-sign orders, determining neg_risk per token
     signed_orders = []
     for order_params in orders:
         side_up = order_params["side"].upper()
+        token_id = order_params["token_id"]
         order_args = OrderArgs(
-            token_id=order_params["token_id"],
+            token_id=token_id,
             price=order_params["price"],
             size=order_params["size"],
             side=BUY if side_up == "BUY" else SELL,
         )
+        neg_risk = get_neg_risk_for_token(client, token_id)
+        options = PartialCreateOrderOptions(neg_risk=neg_risk)
         signed_order = client.create_order(order_args, options)
         signed_orders.append(signed_order)
 
-    # Step 2: Post all orders in a single request when possible.
+    # Post all orders in a single request when possible
     try:
         args = [PostOrdersArgs(order=o, orderType=ot) for o in signed_orders]
         result = client.post_orders(args)
@@ -158,7 +164,7 @@ def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str
             return result
         return [result]
     except Exception:
-        # Fallback to sequential posting if batch fails for any reason.
+        # Fallback to sequential posting
         results: list[dict] = []
         for signed_order in signed_orders:
             try:
@@ -169,15 +175,12 @@ def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str
 
 
 def extract_order_id(result: dict) -> Optional[str]:
-    """Best-effort extraction of an order id from API responses."""
     if not isinstance(result, dict):
         return None
-    # Common variants observed across APIs/versions
     for key in ("orderID", "orderId", "order_id", "id"):
         val = result.get(key)
         if val:
             return str(val)
-    # Sometimes nested
     for key in ("order", "data", "result"):
         nested = result.get(key)
         if isinstance(nested, dict):
@@ -209,10 +212,6 @@ def _coerce_float(val) -> Optional[float]:
 
 
 def summarize_order_state(order_data: dict, *, requested_size: Optional[float] = None) -> dict:
-    """Normalize an order payload into a small, stable summary.
-
-    The API field names vary by version; this function is defensive.
-    """
     if not isinstance(order_data, dict):
         return {"status": None, "filled_size": None, "requested_size": requested_size, "raw": order_data}
 
@@ -225,7 +224,6 @@ def summarize_order_state(order_data: dict, *, requested_size: Optional[float] =
             filled_size = _coerce_float(order_data.get(key))
             break
 
-    # Some payloads provide remaining size rather than filled size
     remaining_size = None
     for key in ("remaining_size", "remainingSize", "size_remaining", "sizeRemaining"):
         if key in order_data:
@@ -259,7 +257,6 @@ def wait_for_terminal_order(
     timeout_seconds: float = 3.0,
     poll_interval_seconds: float = 0.25,
 ) -> dict:
-    """Poll order state until it is terminal, filled, or timeout."""
     terminal_statuses = {"filled", "canceled", "cancelled", "rejected", "expired"}
     start = time.monotonic()
     last_summary: Optional[dict] = None
@@ -294,23 +291,9 @@ def wait_for_terminal_order(
 
 
 def get_positions(settings: Settings, token_ids: list[str] = None) -> dict:
-    """
-    Get current positions (shares owned) for the user.
-    
-    Args:
-        settings: Bot settings
-        token_ids: Optional list of token IDs to filter by
-        
-    Returns:
-        Dictionary with token_id -> position data
-    """
     try:
         client = get_client(settings)
-        
-        # Get all positions for the user
         positions = client.get_positions()
-        
-        # Filter by token_ids if provided
         result = {}
         for pos in positions:
             token_id = pos.get("asset", {}).get("token_id") or pos.get("token_id")
@@ -323,7 +306,6 @@ def get_positions(settings: Settings, token_ids: list[str] = None) -> dict:
                         "avg_price": avg_price,
                         "raw": pos
                     }
-        
         return result
     except Exception as e:
         logger.error(f"Error getting positions: {e}")
