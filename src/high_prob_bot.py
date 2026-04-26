@@ -28,14 +28,11 @@ from .trading import get_client, get_balance, place_buy_gtc
 # ---------------------------------------------------------------------------
 # Logging — file + stdout
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    handlers=[
-        logging.FileHandler("high_prob_bot.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+# File handler only — stdout is owned by the TUI renderer.
+# Startup messages and summaries are written to high_prob_bot.log.
+_file_handler = logging.FileHandler("high_prob_bot.log", encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler])
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -50,6 +47,10 @@ class C:
     CYN = "\033[96m"; WHT = "\033[97m"; GRY = "\033[90m"
 
 
+# True if stdout is a real terminal that supports ANSI
+_IS_TTY = sys.stdout.isatty()
+
+
 def _strip(t: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", t)
 
@@ -58,17 +59,59 @@ def _pad(t: str, w: int = 78) -> str:
     return t + " " * max(0, w - len(_strip(t)))
 
 
+def _cc(value: float, pos_col: str, neg_col: str, rst: str, threshold: float = 1e-4) -> str:
+    """Return color code only when |value| > threshold. Zero = no color."""
+    if not _IS_TTY:
+        return ""
+    if value > threshold:
+        return pos_col
+    if value < -threshold:
+        return neg_col
+    return ""
+
+
+def _c(flag: bool, col: str, rst: str) -> str:
+    """Return color code only when flag is True and stdout is a tty."""
+    return col if (flag and _IS_TTY) else ""
+
+
 _last_render_lines = 0
+
+# ANSI alternate screen + cursor control
+_ALT_ENTER  = "\033[?1049h"   # enter alternate screen (blank, separate from scrollback)
+_ALT_EXIT   = "\033[?1049l"   # exit alternate screen (restores original)
+_CURSOR_OFF = "\033[?25l"     # hide cursor during redraw
+_CURSOR_ON  = "\033[?25h"     # show cursor on exit
+_HOME       = "\033[H"        # cursor to top-left
+
+
+def _enter_tui():
+    """Switch to alternate screen and hide cursor (tty only)."""
+    if _IS_TTY:
+        sys.stdout.write(_ALT_ENTER + _CURSOR_OFF)
+        sys.stdout.flush()
+
+
+def _exit_tui():
+    """Restore original screen and cursor (tty only)."""
+    if _IS_TTY:
+        sys.stdout.write(_CURSOR_ON + _ALT_EXIT)
+        sys.stdout.flush()
 
 
 def _render_buffer(lines: list):
     """
-    Redraw in-place without flicker.
-    Moves cursor to top-left, overwrites each line with ANSI erase-to-EOL,
-    then blanks any leftover lines from a taller previous render.
+    Redraw in-place — no flicker, no leftover text.
+    On a real tty: uses alternate screen + home + erase-to-EOL per line.
+    On a non-tty (piped/redirected): plain newlines (logs/CI friendly).
     """
     global _last_render_lines
-    out = ["\033[H"]
+    if not _IS_TTY:
+        # Non-interactive: just print the last line as a status tick
+        sys.stdout.write("\n".join(_strip(l) for l in lines) + "\n")
+        sys.stdout.flush()
+        return
+    out = [_HOME]
     for line in lines:
         out.append(line + "\033[K\n")
     for _ in range(max(0, _last_render_lines - len(lines))):
@@ -422,6 +465,42 @@ class HighConfBot:
             f"GTC limit (fills or auto-cancels at close)"
         )
 
+
+    # ------------------------------------------------------------------
+    # Stats helpers
+    # ------------------------------------------------------------------
+    def _weighted_stats(self) -> dict:
+        """
+        Weighted win rate: fraction of dollars-at-risk recovered as profit.
+
+          w_wr = total_won / (total_won + total_lost)
+
+        Unlike raw WR (counts), this weights by actual dollar impact, so one
+        large loss is not hidden by several small wins.
+
+        break-even WR = average entry price, because for a binary market:
+          WR × (1 - ask) = (1 - WR) × ask  →  WR = ask
+        """
+        total_won  = sum(t["pnl_usd"] for t in self.trades if t["pnl_usd"] > 0)
+        total_lost = sum(abs(t["pnl_usd"]) for t in self.trades if t["pnl_usd"] < 0)
+        denom = total_won + total_lost
+
+        w_wr = total_won / denom if denom > 0 else None
+
+        asks  = [t["ask"] for t in self.trades if "ask" in t]
+        be_wr = sum(asks) / len(asks) if asks else self.s.prob_threshold
+
+        total  = self.wins + self.losses
+        raw_wr = self.wins / total * 100 if total else None
+
+        return {
+            "raw_wr":     raw_wr,
+            "w_wr":       w_wr,
+            "be_wr":      be_wr,
+            "total_won":  total_won,
+            "total_lost": total_lost,
+        }
+
     # ------------------------------------------------------------------
     # UI  (buffer-based, no flicker)
     # ------------------------------------------------------------------
@@ -441,14 +520,14 @@ class HighConfBot:
         buf.append(f"{W}║{title.center(78)}║{R}")
         divider()
 
-        # Mode + config
+        # Mode + config (two rows so nothing overflows 78 chars)
         mode = f"{C.CYN}SIMULATION{R}" if self.s.dry_run else f"{C.RED}LIVE{R}"
         sl   = f"Stop: {self.s.stop_loss_pct:.0%}" if self.s.stop_loss_pct > 0 else "Stop: off"
         row(
             f" Mode: {mode}   Threshold: {C.YLW}{self.s.prob_threshold:.0%}{R}"
-            f"   Window: last {self.s.entry_window_max_min:.0f} min"
-            f"   Size: {self.s.position_size} shares   {sl}"
+            f"   Window: last {self.s.entry_window_max_min:.0f} min   Size: {self.s.position_size} shares"
         )
+        row(f" {sl}   Poll: {self.s.poll_interval_sec:.1f}s")
         divider()
 
         # Market status
@@ -479,23 +558,38 @@ class HighConfBot:
 
         divider()
 
-        # Stats row 1: wins / losses / WR
-        total = self.wins + self.losses
-        wr    = self.wins / total * 100 if total else 0.0
+        # Stats rows
+        st  = self._weighted_stats()
+        net = self.balance - self.start_balance
+        nc  = _cc(net, C.GRN, C.RED, R)
+
+        # Stats row 1: counts
         row(
-            f" Wins: {C.GRN}{self.wins}{R}  "
-            f"Losses: {C.RED}{self.losses}{R}  "
-            f"Skipped: {C.GRY}{self.skipped}{R}  "
-            f"Win rate: {C.YLW}{wr:.1f}%{R}"
+            f" Wins: {_c(self.wins > 0, C.GRN, R)}{self.wins}{R}  "
+            f"Losses: {_c(self.losses > 0, C.RED, R)}{self.losses}{R}  "
+            f"Skipped: {_c(self.skipped > 0, C.GRY, R)}{self.skipped}{R}"
         )
 
-        # Stats row 2: P&L / balance / invested
-        net = self.balance - self.start_balance
-        nc  = C.GRN if net >= 0 else C.RED
+        # Stats row 2: WR metrics
+        raw_str = f"{st['raw_wr']:.1f}%" if st["raw_wr"] is not None else "n/a"
+        if st["w_wr"] is not None:
+            wc = C.GRN if st["w_wr"] >= st["be_wr"] else C.RED
+            w_str = f"{wc}{st['w_wr']:.1%}{R}"
+        else:
+            w_str = "n/a"
         row(
-            f" Net: {nc}{net:+.2f}${R}  "
+            f" Raw WR: {C.YLW}{raw_str}{R}  "
+            f"Weighted WR: {w_str}  "
+            f"(break-even: {st['be_wr']:.1%})"
+        )
+
+        # Stats row 3: P&L + balance + invested
+        row(
+            f" Net P&L: {nc}{net:+.2f}${R}  "
             f"Balance: ${self.balance:.2f}  "
-            f"Invested: ${self.total_invested:.2f}"
+            f"Invested: ${self.total_invested:.2f}  "
+            f"Won: {_cc(st['total_won'], C.GRN, '', R)}+${st['total_won']:.2f}{R}  "
+            f"Lost: {_cc(st['total_lost'], '', C.RED, R)}-${st['total_lost']:.2f}{R}"
         )
 
         # Trade history
@@ -504,9 +598,9 @@ class HighConfBot:
             row(f" HISTORY (last {min(len(self.trades), 15)})")
             row(f"  #  Time      Market           Side  Ask     Prob   Size  Cost   Result  P&L%    P&L$")
             for i, t in enumerate(reversed(self.trades[-15:]), 1):
-                pc = C.GRN if t["pnl_pct"] > 0 else C.RED
-                uc = C.GRN if t["pnl_usd"] > 0 else C.RED
-                rc = C.GRN if t["result"] == "WIN" else (C.YLW if t["result"] == "STOP" else C.RED)
+                pc = _cc(t["pnl_pct"], C.GRN, C.RED, R)
+                uc = _cc(t["pnl_usd"], C.GRN, C.RED, R)
+                rc = (C.GRN if t["result"] == "WIN" else (C.YLW if t["result"] == "STOP" else C.RED)) if _IS_TTY else ""
                 mkt = (t["slug"] or "?")[-14:]
                 row(
                     f"  {i:2}  {t['time']}  {mkt}  "
@@ -523,32 +617,34 @@ class HighConfBot:
         _render_buffer(buf)
 
     def summary(self):
-        total = self.wins + self.losses
-        wr    = self.wins / total * 100 if total else 0.0
-        net   = self.balance - self.start_balance
+        st  = self._weighted_stats()
+        net = self.balance - self.start_balance
+        raw = f"{st['raw_wr']:.1f}%" if st["raw_wr"] is not None else "n/a"
+        wwr = f"{st['w_wr']:.1%}" if st["w_wr"] is not None else "n/a"
         logger.info("=" * 60)
         logger.info("SESSION SUMMARY")
-        logger.info(f"Wins: {self.wins}  Losses: {self.losses}  WR: {wr:.1f}%")
+        logger.info(f"Wins: {self.wins}  Losses: {self.losses}  Skipped: {self.skipped}")
+        logger.info(f"Raw WR: {raw}  Weighted WR: {wwr}  Break-even: {st['be_wr']:.1%}")
+        logger.info(f"Won: +${st['total_won']:.2f}  Lost: -${st['total_lost']:.2f}")
         logger.info(f"Net P&L: ${net:+.2f}  Balance: ${self.balance:.2f}  Invested: ${self.total_invested:.2f}")
         logger.info("=" * 60)
 
-    async def run(self, poll_interval: float = 1.0):
-        # During the live loop, suppress stdout log handler so it doesn't
-        # fight with the in-place buffer renderer. Events still go to the file.
-        root = logging.getLogger()
-        stdout_handlers = [h for h in root.handlers if isinstance(h, logging.StreamHandler)
-                           and h.stream is sys.stdout]
-        for h in stdout_handlers:
-            h.setLevel(logging.CRITICAL)
+    async def run(self):
+        _enter_tui()
         try:
             while True:
                 self.cycle()
                 self.render()
-                await asyncio.sleep(poll_interval)
+                await asyncio.sleep(self.s.poll_interval_sec)
         except (KeyboardInterrupt, asyncio.CancelledError):
-            for h in stdout_handlers:
-                h.setLevel(logging.INFO)
-            logger.info("Bot stopped by user")
+            pass
+        finally:
+            _exit_tui()
+            # Restore a usable stdout logger for the summary
+            sh = logging.StreamHandler(sys.stdout)
+            sh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s"))
+            logging.getLogger().addHandler(sh)
+            logger.info("Bot stopped")
             self.summary()
 
 
