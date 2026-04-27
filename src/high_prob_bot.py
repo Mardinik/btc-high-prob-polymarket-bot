@@ -99,7 +99,7 @@ _last_render_lines = 0
 
 def _enter_tui():
     if _IS_TTY:
-        sys.stdout.write(_ALT_ENTER + _CURSOR_OFF)
+        sys.stdout.write(_ALT_ENTER + _CURSOR_OFF + "\033[2J" + _HOME)
         sys.stdout.flush()
 
 
@@ -118,8 +118,7 @@ def _render_buffer(lines: list, W: int):
     out = [_HOME]
     for line in lines:
         out.append(line + "\033[K\n")
-    for _ in range(max(0, _last_render_lines - len(lines))):
-        out.append("\033[K\n")
+    out.append("\033[J")
     sys.stdout.write("".join(out))
     sys.stdout.flush()
     _last_render_lines = len(lines)
