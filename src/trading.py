@@ -46,7 +46,7 @@ def get_client(settings: Settings) -> ClobClient:
 
 
 def get_balance(settings: Settings) -> float:
-    """Return USDC balance in dollars."""
+    """Return USDC balance in dollars (6-decimal raw → float)."""
     client = get_client(settings)
     params = BalanceAllowanceParams(
         asset_type=AssetType.COLLATERAL,
@@ -70,39 +70,49 @@ def _neg_risk(client: ClobClient, token_id: str) -> bool:
 def place_buy_gtc(settings: Settings, token_id: str, price: float, size: float) -> dict:
     """
     Place a GTC limit BUY order at `price`.
-    - If liquidity exists at that level → fills immediately.
-    - If not → order rests in the book until filled or market closes (auto-cancelled).
-    Raises RuntimeError on API failure.
+
+    GTC semantics on Polymarket:
+      - Fills immediately if there is liquidity at that price level.
+      - Rests in the order book until filled OR the market closes (auto-cancel).
+      - No capital is lost on unfilled orders.
+
+    Returns the raw API response dict.
+    Raises RuntimeError on any API failure.
     """
     if price <= 0 or size <= 0 or not token_id:
         raise ValueError(f"Invalid order params: token={token_id} price={price} size={size}")
 
-    client = get_client(settings)
+    client    = get_client(settings)
     order_args = OrderArgs(token_id=token_id, price=price, size=size, side=BUY)
     options    = PartialCreateOrderOptions(neg_risk=_neg_risk(client, token_id))
     signed     = client.create_order(order_args, options)
 
     try:
-        return client.post_order(signed, OrderType.GTC)
+        resp = client.post_order(signed, OrderType.GTC)
+        logger.debug(f"BUY GTC response: {resp}")
+        return resp
     except Exception as exc:
         raise RuntimeError(f"place_buy_gtc failed: {exc}") from exc
 
 
 def place_sell_gtc(settings: Settings, token_id: str, price: float, size: float) -> dict:
     """
-    Place a GTC limit SELL order at `price` (stop-loss exit).
-    Rests in the book until filled or market close (auto-cancelled).
-    Raises RuntimeError on API failure.
+    Place a GTC limit SELL order at `price` (used for stop-loss exit).
+
+    Returns the raw API response dict.
+    Raises RuntimeError on any API failure.
     """
     if price <= 0 or size <= 0 or not token_id:
         raise ValueError(f"Invalid order params: token={token_id} price={price} size={size}")
 
-    client = get_client(settings)
+    client    = get_client(settings)
     order_args = OrderArgs(token_id=token_id, price=price, size=size, side=SELL)
     options    = PartialCreateOrderOptions(neg_risk=_neg_risk(client, token_id))
     signed     = client.create_order(order_args, options)
 
     try:
-        return client.post_order(signed, OrderType.GTC)
+        resp = client.post_order(signed, OrderType.GTC)
+        logger.debug(f"SELL GTC response: {resp}")
+        return resp
     except Exception as exc:
         raise RuntimeError(f"place_sell_gtc failed: {exc}") from exc
