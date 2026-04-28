@@ -1,120 +1,86 @@
 """
-Simple script to test Polymarket balance retrieval.
+Simple script to test Polymarket V2 balance retrieval.
 """
 import os
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
+from py_clob_client_v2 import ClobClient, ApiCreds
 
 load_dotenv()
 
 def main():
-    # Load configuration
-    host = "https://clob.polymarket.com"
-    private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
-    api_key = os.getenv("POLYMARKET_API_KEY")
-    api_secret = os.getenv("POLYMARKET_API_SECRET")
+    host           = "https://clob.polymarket.com"
+    private_key    = os.getenv("POLYMARKET_PRIVATE_KEY")
+    api_key        = os.getenv("POLYMARKET_API_KEY")
+    api_secret     = os.getenv("POLYMARKET_API_SECRET")
     api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE")
     signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
-    funder = os.getenv("POLYMARKET_FUNDER", "")
-    
+    funder         = os.getenv("POLYMARKET_FUNDER", "") or None
+
     print("=" * 70)
-    print("POLYMARKET BALANCE TEST")
+    print("POLYMARKET V2 BALANCE TEST")
     print("=" * 70)
-    print(f"Host: {host}")
-    print(f"Signature Type: {signature_type}")
-    print(f"Private Key: {'✓' if private_key else '✗'}")
-    print(f"API Key: {'✓' if api_key else '✗'}")
-    print(f"API Secret: {'✓' if api_secret else '✗'}")
-    print(f"API Passphrase: {'✓' if api_passphrase else '✗'}")
+    print(f"Host:            {host}")
+    print(f"Signature Type:  {signature_type}")
+    print(f"Private Key:     {'✓' if private_key else '✗ MISSING'}")
+    print(f"API Key:         {'✓' if api_key else '✗ (will derive)'}")
     print("=" * 70)
-    
+
     try:
-        # Create client
-        print("\n1. Creating ClobClient...")
-        client = ClobClient(
-            host,
-            key=private_key,
+        # --- Step 1: derive credentials ---
+        print("\n1. Deriving API credentials (L1 auth)...")
+        l1 = ClobClient(
+            host=host,
             chain_id=137,
+            key=private_key,
+            funder=funder,
             signature_type=signature_type,
-            funder=funder or None
         )
-        print("   ✓ Client created")
-        
-        # Derive credentials from private key
-        print("\n2. Deriving API credentials from private key...")
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
+        creds = l1.create_or_derive_api_key()
         print(f"   ✓ API Key: {creds.api_key}")
-        print(f"   ✓ Credentials configured")
-        
-        # Get wallet address
-        print("\n3. Getting wallet address...")
+
+        # --- Step 2: full authenticated client ---
+        print("\n2. Building authenticated client (L1 + L2)...")
+        client = ClobClient(
+            host=host,
+            chain_id=137,
+            key=private_key,
+            funder=funder,
+            signature_type=signature_type,
+            creds=creds,
+        )
         address = client.get_address()
-        print(f"   ✓ Address: {address}")
-        
-        # Get balance - Method 1: COLLATERAL (USDC)
-        print("\n4. Getting USDC balance (COLLATERAL)...")
+        print(f"   ✓ Wallet: {address}")
+
+        # --- Step 3: balance ---
+        print("\n3. Fetching pUSD balance...")
         try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-            
-            params = BalanceAllowanceParams(
-                asset_type=AssetType.COLLATERAL,
-                signature_type=signature_type
-            )
-            result = client.get_balance_allowance(params)
-            print(f"   Response type: {type(result)}")
-            print(f"   Response: {result}")
-            
+            result = client.get_balance()
+            print(f"   Raw response: {result}")
             if isinstance(result, dict):
-                # Response should have 'balance' and 'allowance'
-                balance_raw = result.get("balance", "0")
-                balance_wei = float(balance_raw)
-                # USDC has 6 decimals
-                balance_usdc = balance_wei / 1_000_000
-                
-                print(f"\n   Balance raw: {balance_raw}")
-                print(f"   Balance in wei: {balance_wei}")
-                print(f"   💰 BALANCE USDC: ${balance_usdc:.6f}")
-                
-                # Verify balance directly on blockchain
-                print("\n5. Verifying balance directly on Polygon...")
-                try:
-                    from web3 import Web3
-                    # Connect to Polygon
-                    w3 = Web3(Web3.HTTPProvider('https://polygon-rpc.com'))
-                    
-                    # USDC contract address on Polygon
-                    usdc_address = Web3.to_checksum_address('0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174')
-                    
-                    # Minimal ABI for balanceOf
-                    usdc_abi = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
-                    
-                    usdc_contract = w3.eth.contract(address=usdc_address, abi=usdc_abi)
-                    wallet_address = Web3.to_checksum_address(address)
-                    
-                    # Get real balance
-                    balance_onchain = usdc_contract.functions.balanceOf(wallet_address).call()
-                    balance_onchain_usdc = balance_onchain / 1_000_000
-                    
-                    print(f"   🔗 Balance on-chain: ${balance_onchain_usdc:.6f}")
-                    
-                except Exception as e:
-                    print(f"   ⚠️ Could not verify on-chain: {e}")
+                raw = float(result.get("balance", 0))
             else:
-                print(f"\n   ⚠️ Unexpected response: {result}")
+                raw = float(result)
+            print(f"   💰 pUSD balance: ${raw / 1_000_000:.6f}")
         except Exception as e:
-            print(f"   ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
-        
+            print(f"   get_balance() failed: {e}")
+            print("   Trying get_balance_allowance()...")
+            try:
+                from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                result = client.get_balance_allowance(params)
+                print(f"   Raw: {result}")
+                raw = float(result.get("balance", 0))
+                print(f"   💰 pUSD balance: ${raw / 1_000_000:.6f}")
+            except Exception as e2:
+                print(f"   Both methods failed: {e2}")
+
         print("\n" + "=" * 70)
-        print("TEST COMPLETED")
+        print("TEST COMPLETE")
         print("=" * 70)
-        
+
     except Exception as e:
-        print(f"\n✗ ERROR: {e}")
         import traceback
+        print(f"\n✗ ERROR: {e}")
         traceback.print_exc()
 
 if __name__ == "__main__":

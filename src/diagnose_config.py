@@ -37,12 +37,12 @@ def main():
     # 2. Derive addresses
     print("2. Deriving addresses from private key...")
     try:
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2.client import ClobClient
 
         client = ClobClient(
             "https://clob.polymarket.com",
             key=private_key.strip(),
-            chain_id=137,
+            chain=137,
             signature_type=signature_type,
             funder=funder.strip() if funder else None,
         )
@@ -73,7 +73,7 @@ def main():
         # 4. Get balance through API
         print("4. Checking USDC balance via Polymarket API...")
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
             derived_creds = client.create_or_derive_api_creds()
             client.set_api_creds(derived_creds)

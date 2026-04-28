@@ -1,25 +1,36 @@
+"""Generate or derive Polymarket V2 API credentials from a private key."""
 import os
-from py_clob_client.client import ClobClient
 from dotenv import load_dotenv
-# Load the environment variables from the .env file
+from py_clob_client_v2 import ClobClient
+
 load_dotenv()
+
 def main():
-    host = "https://clob.polymarket.com"
-    key = os.getenv("POLYMARKET_PRIVATE_KEY")
-    chain_id = 137  # Polygon Mainnet chain ID
-    # Ensure the private key is loaded correctly
+    host        = "https://clob.polymarket.com"
+    key         = os.getenv("POLYMARKET_PRIVATE_KEY")
+    funder      = os.getenv("POLYMARKET_FUNDER", "") or None
+    sig_type    = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
+    chain_id    = 137
+
     if not key:
-        raise ValueError("Private key not found. Please set POLYMARKET_PRIVATE_KEY in the environment variables.")
-    # Initialize the client with your private key
-    client = ClobClient(host, key=key, chain_id=chain_id)
-    # Create or derive API credentials (this is where the API key, secret, and passphrase are generated)
+        raise ValueError("POLYMARKET_PRIVATE_KEY not set in .env")
+
+    client = ClobClient(
+        host=host,
+        chain_id=chain_id,
+        key=key,
+        funder=funder,
+        signature_type=sig_type,
+    )
+
     try:
-        api_creds = client.create_or_derive_api_creds()
-        print("API Key:", api_creds.api_key)
-        print("Secret:", api_creds.api_secret)
-        print("Passphrase:", api_creds.api_passphrase)
-        # You should now save these securely (e.g., store them in your .env file)
+        creds = client.create_or_derive_api_key()
+        print("Add these to your .env:\n")
+        print(f"POLYMARKET_API_KEY={creds.api_key}")
+        print(f"POLYMARKET_API_SECRET={creds.api_secret}")
+        print(f"POLYMARKET_API_PASSPHRASE={creds.api_passphrase}")
     except Exception as e:
-        print("Error creating or deriving API credentials:", e)
+        print(f"Error: {e}")
+
 if __name__ == "__main__":
     main()
