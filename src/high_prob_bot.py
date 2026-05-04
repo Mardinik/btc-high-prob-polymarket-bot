@@ -163,6 +163,7 @@ class HighConfBot:
         self.total_invested = 0.0
         self.last_scan = "—"
         self.last_scan_ts: float = 0.0
+        self.last_skip_reason = "—"
 
         # Balance
         if s.dry_run:
@@ -525,12 +526,30 @@ class HighConfBot:
             return
 
         thr = self.s.prob_threshold
+        max_prob = max(prob_up, prob_dn)
         self.last_scan = (
             f"UP {prob_up:.1%}  DOWN {prob_dn:.1%} "
-            f"{'→ SIGNAL' if max(prob_up, prob_dn) >= thr else '→ no signal'}"
+            f"{'→ SIGNAL' if max_prob >= thr else '→ no signal'}"
         )
 
-        # 6. Signal?
+        # 6. Low-conviction close filter:
+        #    If neither side reaches 60% with <30s left, the market is too
+        #    undecided to enter — skip and wait for the next market.
+        LOW_CONV_THR  = 0.60
+        LOW_CONV_SECS = 30.0
+        if secs_left < LOW_CONV_SECS and max_prob < LOW_CONV_THR:
+            reason = (
+                f"⏭ skip — max prob {max_prob:.0%} < 60% with {int(secs_left)}s left"
+            )
+            self.last_skip_reason = reason
+            self.last_scan = reason
+            self.skipped += 1
+            logger.info(reason)
+            # Market is closing undecided — no point waiting; load next one
+            self._load_market()
+            return
+
+        # 7. Signal?
         if prob_up >= thr and prices.get("up_ask"):
             self._enter("UP", prices["up_ask"], prob_up)
         elif prob_dn >= thr and prices.get("dn_ask"):
@@ -543,9 +562,10 @@ class HighConfBot:
         token = self.yes_token if side == "UP" else self.no_token
 
         if self.balance < cost:
-            logger.warning(
-                f"Insufficient balance ${self.balance:.2f} < cost ${cost:.2f} — skipping"
-            )
+            reason = f"⏭ skip — insufficient balance ${self.balance:.2f} < cost ${cost:.2f}"
+            self.last_skip_reason = reason
+            self.last_scan = reason
+            logger.warning(reason)
             self.skipped += 1
             return
 
@@ -675,11 +695,14 @@ class HighConfBot:
         net = self.balance - self.start_balance
         nc  = _cc(net, C.GRN, C.RED)
 
+        skip_col = C.YLW if self.skipped > 0 else ""
         row(
             f" Wins: {_c(self.wins > 0, C.GRN)}{self.wins}{R}  "
             f"Losses: {_c(self.losses > 0, C.RED)}{self.losses}{R}  "
-            f"Skipped: {_c(self.skipped > 0, C.GRY)}{self.skipped}{R}"
+            f"Skipped: {skip_col if _IS_TTY else ''}{self.skipped}{R}"
         )
+        if self.skipped > 0:
+            row(f"  {C.GRY if _IS_TTY else ''}Last skip: {self.last_skip_reason}{R}")
 
         raw_str = f"{st['raw_wr']:.1f}%" if st["raw_wr"] is not None else "n/a"
         if st["w_wr"] is not None:
