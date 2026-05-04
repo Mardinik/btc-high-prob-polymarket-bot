@@ -381,12 +381,17 @@ class HighConfBot:
             self.wins += 1
             pnl_usd = (1.0 - bet["ask"]) * bet["size"]
             pnl_pct = (1.0 / bet["ask"] - 1.0) * 100
-            if self.s.dry_run:
-                self.balance += bet["size"]          # $1/share on WIN
+            # In dry_run: add $1/share received. In live: restore the optimistic
+            # deduction + add profit so the display is correct while we wait for
+            # get_balance() to overwrite with the real on-chain value.
+            self.balance += bet["size"]
         else:
             self.losses += 1
             pnl_usd = -bet["cost"]
             pnl_pct = -100.0
+            # In live: cost was already deducted optimistically at entry.
+            # On a loss, nothing to restore — the money is gone. get_balance()
+            # will confirm the real value.
 
         self.trades.append({
             "slug":    self.slug,
@@ -692,7 +697,11 @@ class HighConfBot:
 
         # ── Stats ────────────────────────────────────────────────────────
         st  = self._weighted_stats()
-        net = self.balance - self.start_balance
+        # Net P&L is always computed from recorded trade outcomes, not from
+        # balance delta. This avoids timing issues in live mode where
+        # self.balance may still hold the optimistic deduction between
+        # _record_result() and the next get_balance() call.
+        net = st["total_won"] - st["total_lost"]
         nc  = _cc(net, C.GRN, C.RED)
 
         skip_col = C.YLW if self.skipped > 0 else ""
