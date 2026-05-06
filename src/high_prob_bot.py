@@ -164,6 +164,7 @@ class HighConfBot:
         self.last_scan = "—"
         self.last_scan_ts: float = 0.0
         self.last_skip_reason = "—"
+        self._syncing_balance = False  # True while waiting for autoredeem
 
         # Balance
         if s.dry_run:
@@ -337,6 +338,62 @@ class HighConfBot:
             return True
 
     # ------------------------------------------------------------------
+    # Balance refresh — handles autoredeem delay
+    # ------------------------------------------------------------------
+    async def _refresh_balance_after_redeem(self, max_wait: float = 15.0, interval: float = 2.0):
+        """
+        Fetch the real on-chain balance after market resolution, retrying
+        until the value stabilises or max_wait seconds elapse.
+
+        Polymarket's autoredeem converts winning shares to pUSD automatically,
+        but the on-chain settlement can take a few seconds after the market
+        closes. Calling get_balance() immediately after resolution may return
+        a pre-redeem value (cost already deducted, payout not yet credited).
+
+        Strategy:
+          • Poll every `interval` seconds for up to `max_wait` seconds.
+          • Accept the balance once it is ≥ the last known value OR once
+            max_wait is exhausted (use whatever we have at that point).
+          • Log each attempt so the timing can be diagnosed.
+        """
+        prev = self.balance
+        elapsed = 0.0
+        attempt = 0
+        while elapsed <= max_wait:
+            await asyncio.sleep(interval)
+            elapsed += interval
+            attempt += 1
+            try:
+                new_bal = get_balance(self.s)
+            except Exception as e:
+                logger.warning(f"[balance] get_balance attempt {attempt} failed: {e}")
+                continue
+
+            logger.info(
+                f"[balance] attempt {attempt}  elapsed={elapsed:.0f}s  "
+                f"prev=${prev:.2f}  fetched=${new_bal:.2f}"
+            )
+
+            # If balance has risen (autoredeem credited) or is equal → settle
+            if new_bal >= self.balance - 0.01:   # small tolerance for fees
+                self.balance = new_bal
+                logger.info(f"[balance] settled at ${self.balance:.2f} after {elapsed:.0f}s")
+                return
+
+            # Balance still lower than expected — autoredeem not yet processed
+            logger.info(f"[balance] waiting for autoredeem to settle…")
+
+        # Timeout — use whatever the chain shows now
+        try:
+            self.balance = get_balance(self.s)
+        except Exception:
+            pass
+        logger.warning(
+            f"[balance] autoredeem did not settle within {max_wait:.0f}s. "
+            f"Using ${self.balance:.2f}. Check dashboard."
+        )
+
+    # ------------------------------------------------------------------
     # Resolution
     # ------------------------------------------------------------------
     async def _resolve_market(self):
@@ -368,7 +425,9 @@ class HighConfBot:
                 self.bet = None   # unfilled — discard silently after balance restore
 
         if not self.s.dry_run:
-            self.balance = get_balance(self.s)
+            self._syncing_balance = True
+            await self._refresh_balance_after_redeem()
+            self._syncing_balance = False
 
         logger.info(f"Balance after resolution: ${self.balance:.2f}")
         self._load_market()
@@ -381,17 +440,20 @@ class HighConfBot:
             self.wins += 1
             pnl_usd = (1.0 - bet["ask"]) * bet["size"]
             pnl_pct = (1.0 / bet["ask"] - 1.0) * 100
-            # In dry_run: add $1/share received. In live: restore the optimistic
-            # deduction + add profit so the display is correct while we wait for
-            # get_balance() to overwrite with the real on-chain value.
-            self.balance += bet["size"]
+            if self.s.dry_run:
+                # No on-chain refresh in dry_run — credit the payout directly.
+                self.balance += bet["size"]
+            # In live mode: balance is NOT touched here.
+            # _refresh_balance_after_redeem() will fetch the real on-chain value
+            # once autoredeem has settled, avoiding an overwrite with a stale
+            # pre-redemption figure.
         else:
             self.losses += 1
             pnl_usd = -bet["cost"]
             pnl_pct = -100.0
             # In live: cost was already deducted optimistically at entry.
-            # On a loss, nothing to restore — the money is gone. get_balance()
-            # will confirm the real value.
+            # On a loss, nothing to restore — the money is gone.
+            # _refresh_balance_after_redeem() confirms the real value.
 
         self.trades.append({
             "slug":    self.slug,
@@ -725,9 +787,13 @@ class HighConfBot:
             f"(break-even: {st['be_wr']:.1%})"
         )
 
+        bal_label = (
+            f"{C.YLW}↻ syncing…{R}" if (not self.s.dry_run and self._syncing_balance)
+            else f"${self.balance:.2f}"
+        )
         row(
             f" Net P&L: {nc}{net:+.2f}${R}  "
-            f"Balance: ${self.balance:.2f}  "
+            f"Balance: {bal_label}  "
             f"Invested: ${self.total_invested:.2f}  "
             f"Won: {_cc(st['total_won'], C.GRN, '')}"
             f"+${st['total_won']:.2f}{R}  "
