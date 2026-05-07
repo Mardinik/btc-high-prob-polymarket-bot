@@ -759,11 +759,11 @@ class HighConfBot:
 
         # ── Stats ────────────────────────────────────────────────────────
         st  = self._weighted_stats()
-        # Net P&L is always computed from recorded trade outcomes, not from
-        # balance delta. This avoids timing issues in live mode where
-        # self.balance may still hold the optimistic deduction between
-        # _record_result() and the next get_balance() call.
-        net = st["total_won"] - st["total_lost"]
+        # Net P&L = real money difference since session start.
+        # In live: self.balance is refreshed from chain after every resolution
+        # (with autoredeem wait), so this always reflects actual funds.
+        # In dry_run: balance is updated directly on each trade.
+        net = self.balance - self.start_balance
         nc  = _cc(net, C.GRN, C.RED)
 
         skip_col = C.YLW if self.skipped > 0 else ""
