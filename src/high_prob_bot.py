@@ -181,7 +181,7 @@ class HighConfBot:
     # Market management
     # ------------------------------------------------------------------
     def _load_market(self):
-        slug = find_active_slug()
+        slug = find_active_slug(self.s.slug_prefix, self.s.market_duration)
         if not slug:
             self.slug = None
             return
@@ -197,7 +197,7 @@ class HighConfBot:
         self.yes_token = info["yes_token_id"]
         self.no_token  = info["no_token_id"]
         self.outcomes  = info.get("outcomes") or ["UP", "DOWN"]
-        self.end_ts = slug_end_ts(slug)
+        self.end_ts = slug_end_ts(slug, self.s.market_duration)
         self.bet    = None
         self.stop_triggered = False
         self._last_prices   = {}
@@ -209,13 +209,13 @@ class HighConfBot:
 
     def _seconds_left(self) -> float:
         if not self.end_ts:
-            return 900.0
+            return float(self.s.market_duration)
         return max(0.0, self.end_ts - time.time())
 
     def _seconds_elapsed(self) -> float:
         if not self.end_ts:
             return 0.0
-        return max(0.0, 900.0 - self._seconds_left())
+        return max(0.0, float(self.s.market_duration) - self._seconds_left())
 
     def _time_str(self) -> str:
         s = int(self._seconds_left())
@@ -340,57 +340,83 @@ class HighConfBot:
     # ------------------------------------------------------------------
     # Balance refresh — handles autoredeem delay
     # ------------------------------------------------------------------
-    async def _refresh_balance_after_redeem(self, max_wait: float = 15.0, interval: float = 2.0):
+    async def _refresh_balance_after_redeem(
+        self,
+        won: Optional[bool] = None,
+        max_wait: float = 20.0,
+        interval: float = 2.0,
+    ):
         """
-        Fetch the real on-chain balance after market resolution, retrying
-        until the value stabilises or max_wait seconds elapse.
+        Refresh the on-chain balance after market resolution.
 
-        Polymarket's autoredeem converts winning shares to pUSD automatically,
-        but the on-chain settlement can take a few seconds after the market
-        closes. Calling get_balance() immediately after resolution may return
-        a pre-redeem value (cost already deducted, payout not yet credited).
+        Behaviour differs by outcome:
 
-        Strategy:
-          • Poll every `interval` seconds for up to `max_wait` seconds.
-          • Accept the balance once it is ≥ the last known value OR once
-            max_wait is exhausted (use whatever we have at that point).
-          • Log each attempt so the timing can be diagnosed.
+        WIN  (won=True)
+          Autoredeem credits `size` pUSD after settlement — this takes a few
+          seconds. We poll until the balance INCREASES above the current value
+          (which already has cost deducted). Accepting a flat balance too early
+          would show the pre-redemption figure as the final balance.
+
+        LOSS (won=False) or no bet (won=None)
+          No autoredeem will fire. A single get_balance() call is enough.
+
+        In all cases we cap waiting at max_wait seconds and use whatever
+        value the chain returns at timeout.
         """
-        prev = self.balance
-        elapsed = 0.0
-        attempt = 0
+        if won is False or won is None:
+            # Loss or no trade — one refresh is sufficient, no redemption pending.
+            await asyncio.sleep(1.0)
+            try:
+                self.balance = get_balance(self.s)
+                logger.info(f"[balance] refreshed (no redeem expected): ${self.balance:.2f}")
+            except Exception as e:
+                logger.warning(f"[balance] get_balance failed: {e}")
+            return
+
+        # WIN path — wait for autoredeem to credit payout.
+        # Reference: balance BEFORE resolution (cost already deducted).
+        # We wait until the chain balance exceeds this, confirming the credit.
+        baseline = self.balance
+        elapsed  = 0.0
+        attempt  = 0
+
+        # Short initial wait to give Polymarket time to settle the resolution.
+        await asyncio.sleep(3.0)
+        elapsed += 3.0
+
         while elapsed <= max_wait:
-            await asyncio.sleep(interval)
-            elapsed += interval
             attempt += 1
             try:
                 new_bal = get_balance(self.s)
             except Exception as e:
-                logger.warning(f"[balance] get_balance attempt {attempt} failed: {e}")
+                logger.warning(f"[balance] attempt {attempt} failed: {e}")
+                await asyncio.sleep(interval)
+                elapsed += interval
                 continue
 
             logger.info(
-                f"[balance] attempt {attempt}  elapsed={elapsed:.0f}s  "
-                f"prev=${prev:.2f}  fetched=${new_bal:.2f}"
+                f"[balance] WIN attempt {attempt}  elapsed={elapsed:.0f}s  "
+                f"baseline=${baseline:.2f}  fetched=${new_bal:.2f}"
             )
 
-            # If balance has risen (autoredeem credited) or is equal → settle
-            if new_bal >= self.balance - 0.01:   # small tolerance for fees
+            if new_bal > baseline + 0.01:
+                # Balance rose above baseline → autoredeem credited
                 self.balance = new_bal
-                logger.info(f"[balance] settled at ${self.balance:.2f} after {elapsed:.0f}s")
+                logger.info(f"[balance] autoredeem confirmed at ${self.balance:.2f} (+{elapsed:.0f}s)")
                 return
 
-            # Balance still lower than expected — autoredeem not yet processed
-            logger.info(f"[balance] waiting for autoredeem to settle…")
+            logger.info("[balance] autoredeem not yet credited, waiting…")
+            await asyncio.sleep(interval)
+            elapsed += interval
 
-        # Timeout — use whatever the chain shows now
+        # Timeout — accept whatever the chain shows
         try:
             self.balance = get_balance(self.s)
         except Exception:
             pass
         logger.warning(
             f"[balance] autoredeem did not settle within {max_wait:.0f}s. "
-            f"Using ${self.balance:.2f}. Check dashboard."
+            f"Balance=${self.balance:.2f}. Verify on dashboard."
         )
 
     # ------------------------------------------------------------------
@@ -418,15 +444,17 @@ class HighConfBot:
 
         logger.info(f"Market closed. Winner: {winner}")
 
+        _won: Optional[bool] = None
         if self.bet:
             if self._check_fill():
+                _won = self.bet["side"] == winner   # capture before _record_result clears bet
                 self._record_result(winner)
             else:
                 self.bet = None   # unfilled — discard silently after balance restore
 
         if not self.s.dry_run:
             self._syncing_balance = True
-            await self._refresh_balance_after_redeem()
+            await self._refresh_balance_after_redeem(won=_won)
             self._syncing_balance = False
 
         logger.info(f"Balance after resolution: ${self.balance:.2f}")
@@ -603,7 +631,7 @@ class HighConfBot:
         #    If neither side reaches 60% with <30s left, the market is too
         #    undecided to enter — skip and wait for the next market.
         LOW_CONV_THR  = 0.60
-        LOW_CONV_SECS = 30.0
+        LOW_CONV_SECS = self.s.low_conv_secs
         if secs_left < LOW_CONV_SECS and max_prob < LOW_CONV_THR:
             reason = (
                 f"⏭ skip — max prob {max_prob:.0%} < 60% with {int(secs_left)}s left"
@@ -699,7 +727,7 @@ class HighConfBot:
             buf.append(f"{WB}{l}{m * IW}{r}{R}")
 
         # ── Header ──────────────────────────────────────────────────────
-        title = "HIGH-CONFIDENCE BOT  ·  BTC 15-min  ·  Polymarket"
+        title = f"HIGH-CONFIDENCE BOT  ·  {self.s.asset.upper()} {self.s.market_type}  ·  Polymarket"
         buf.append(f"{WB}╔{'═' * IW}╗{R}")
         buf.append(f"{WB}║{title.center(IW)}║{R}")
         divider()
@@ -723,7 +751,7 @@ class HighConfBot:
             mins, secsrem = secs // 60, secs % 60
             elapsed    = self._seconds_elapsed()
             tc = C.GRN if secs > 120 else C.YLW if secs > 45 else C.RED
-            bar = _progress_bar(elapsed, width=min(30, IW // 4))
+            bar = _progress_bar(elapsed, total_secs=float(self.s.market_duration), width=min(30, IW // 4))
             row(
                 f" Market: {C.CYN}{slug_short}{R}  "
                 f"Time left: {tc}{mins:02d}:{secsrem:02d}{R}  "

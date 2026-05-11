@@ -1,42 +1,50 @@
 import os
-from dataclasses import dataclass
 from dotenv import load_dotenv
 
-load_dotenv(override=False)
+_env_file = os.getenv("ENV_FILE", ".env")
+load_dotenv(_env_file, override=False)
 
 
-@dataclass
 class Settings:
-    # --- Credenciales Polymarket ---
-    private_key:    str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-    api_key:        str = os.getenv("POLYMARKET_API_KEY", "")
-    api_secret:     str = os.getenv("POLYMARKET_API_SECRET", "")
-    api_passphrase: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
-    signature_type: int = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
-    funder:         str = os.getenv("POLYMARKET_FUNDER", "")
+    def __init__(self):
+        # --- Credenciales ---
+        self.private_key    = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+        self.api_key        = os.getenv("POLYMARKET_API_KEY", "")
+        self.api_secret     = os.getenv("POLYMARKET_API_SECRET", "")
+        self.api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+        self.signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
+        self.funder         = os.getenv("POLYMARKET_FUNDER", "")
 
-    # --- Estrategia ---
-    # Probabilidad mínima (= ask price del lado ganador) para entrar (0.0–1.0).
-    # NOTA: se compara directamente contra el ask, no contra el mid normalizado.
-    prob_threshold:       float = float(os.getenv("PROB_THRESHOLD", "0.90"))
+        # --- Mercado ---
+        # MARKET_TYPE: "15m" o "5m"
+        self.market_type = os.getenv("MARKET_TYPE", "15m").lower().strip()
+        # ASSET: "btc", "eth", "sol" (solo btc+eth disponibles en 5m)
+        self.asset       = os.getenv("ASSET", "btc").lower().strip()
 
-    # Ventana de entrada: entre ENTRY_WINDOW_MIN_SEC segundos y ENTRY_WINDOW_MAX_MIN minutos
-    entry_window_max_min: float = float(os.getenv("ENTRY_WINDOW_MAX_MIN", "5.0"))
-    entry_window_min_sec: float = float(os.getenv("ENTRY_WINDOW_MIN_SEC", "45.0"))
+        # Derivados del tipo de mercado
+        _is_5m = self.market_type == "5m"
+        self.market_duration: int = 300 if _is_5m else 900
+        self.slug_prefix: str     = f"{self.asset}-updown-{self.market_type}"
 
-    # Tamaño de posición en shares (mínimo 5 en Polymarket)
-    position_size:        float = float(os.getenv("POSITION_SIZE", "5"))
+        # Defaults de ventana según duración
+        _def_max = "1.0"  if _is_5m else "5.0"
+        _def_min = "20.0" if _is_5m else "45.0"
+        _def_lcs = "12.0" if _is_5m else "30.0"
 
-    # Stop-loss: vender si el bid cae este % bajo el precio de entrada.
-    # 0.0 = desactivado (recomendado con <5 min restantes — evita whipsaw).
-    stop_loss_pct:        float = float(os.getenv("STOP_LOSS_PCT", "0.0"))
+        # --- Estrategia ---
+        self.prob_threshold       = float(os.getenv("PROB_THRESHOLD", "0.90"))
+        self.entry_window_max_min = float(os.getenv("ENTRY_WINDOW_MAX_MIN", _def_max))
+        self.entry_window_min_sec = float(os.getenv("ENTRY_WINDOW_MIN_SEC", _def_min))
+        self.low_conv_secs        = float(os.getenv("LOW_CONV_SECS", _def_lcs))
+        self.position_size        = float(os.getenv("POSITION_SIZE", "5"))
+        self.stop_loss_pct        = float(os.getenv("STOP_LOSS_PCT", "0.0"))
 
-    # --- Operación ---
-    poll_interval_sec: float = float(os.getenv("POLL_INTERVAL_SEC", "1.0"))
+        # --- Operación ---
+        self.poll_interval_sec = float(os.getenv("POLL_INTERVAL_SEC", "1.0"))
 
-    # --- Simulación ---
-    dry_run:     bool  = os.getenv("DRY_RUN", "true").lower() == "true"
-    sim_balance: float = float(os.getenv("SIM_BALANCE", "400"))
+        # --- Simulación ---
+        self.dry_run     = os.getenv("DRY_RUN", "true").lower() == "true"
+        self.sim_balance = float(os.getenv("SIM_BALANCE", "400"))
 
 
 def load_settings() -> Settings:
